@@ -525,6 +525,27 @@ func (repo *FileRepository) GetOwnerToFileIDsMap(ctx context.Context, fileIDs []
 	}
 	return result, nil
 }
+
+// GetDistinctFileApps returns the apps of the given files. Files created
+// before files.app existed have no stored app and are reported as Photos.
+func (repo *FileRepository) GetDistinctFileApps(ctx context.Context, fileIDs []int64) ([]ente.App, error) {
+	rows, err := repo.DB.QueryContext(ctx, `SELECT DISTINCT COALESCE(app, 'photos') FROM files WHERE file_id = ANY($1)`,
+		pq.Array(fileIDs))
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	defer rows.Close()
+	apps := make([]ente.App, 0)
+	for rows.Next() {
+		var app ente.App
+		if err = rows.Scan(&app); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		apps = append(apps, app)
+	}
+	return apps, stacktrace.Propagate(rows.Err(), "")
+}
+
 func (repo *FileRepository) VerifyFileOwner(ctx context.Context, fileIDs []int64, ownerID int64, logger *log.Entry) error {
 	countMap, err := repo.GetOwnerToFileCountMap(ctx, fileIDs)
 	if err != nil {

@@ -70,6 +70,11 @@ apps:
     # If you're running a self-hosted instance and wish to serve public links for locker,
     # set this to the URL where your share web app is running.
     public-locker:
+    # Defaults to public-locker
+    #
+    # If you're running a self-hosted instance and wish to serve public links for drive,
+    # set this to the URL where your drive share web app is running.
+    public-drive:
     # Default is https://paste.ente.com
     #
     # If you're running a self-hosted instance and wish to serve Ente Paste,

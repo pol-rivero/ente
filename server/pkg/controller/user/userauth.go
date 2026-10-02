@@ -421,7 +421,7 @@ const (
 )
 
 func shouldEnforceStorageWarningDeletionLoginBlock(app ente.App) bool {
-	return app == ente.Photos || app == ente.Locker
+	return app == ente.Photos || app == ente.Locker || app == ente.Drive
 }
 
 func storageWarningDeletionScheduledError() error {
@@ -509,6 +509,7 @@ func (c *UserController) notifyLogin(ctx *gin.Context, userID int64, app ente.Ap
 				ente.Photos: "Ente Photos",
 				ente.Auth:   "Ente Auth",
 				ente.Locker: "Ente Locker",
+				ente.Drive:  "Ente Drive",
 			}
 			appName, ok := appDisplayNames[app]
 			if !ok {

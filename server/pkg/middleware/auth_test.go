@@ -19,6 +19,7 @@ type authRouteTestTokens struct {
 	auth    string
 	photos  string
 	locker  string
+	drive   string
 	family  string
 	payment string
 }
@@ -111,6 +112,27 @@ func TestRejectAuthAppKeepsAuthRoutesAndBlocksStorageRoutes(t *testing.T) {
 			wantStatus: http.StatusNoContent,
 		},
 		{
+			name:       "drive token can access storage route",
+			path:       "/collections/v2",
+			token:      tokens.drive,
+			clientPkg:  "io.ente.drive",
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "drive token with photos header is invalid",
+			path:       "/collections/v2",
+			token:      tokens.drive,
+			clientPkg:  "io.ente.photos",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "photos token with drive header is invalid",
+			path:       "/collections/v2",
+			token:      tokens.photos,
+			clientPkg:  "io.ente.drive",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
 			name:       "auth token with photos header remains invalid",
 			path:       "/collections/v2",
 			token:      tokens.auth,
@@ -163,6 +185,14 @@ func TestSessionBoundJWTAuthentication(t *testing.T) {
 		t.Fatalf("active session JWT status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
 	}
 
+	driveJWT, err := userController.GetSessionJWTToken(91001, jwt.FAMILIES, tokens.drive, ente.Drive)
+	if err != nil {
+		t.Fatalf("failed to create Drive session JWT: %v", err)
+	}
+	if recorder := performAuthRouteRequest(router, "/family/test", driveJWT, "io.ente.drive"); recorder.Code != http.StatusNoContent {
+		t.Fatalf("Drive session JWT status = %d, want %d; body=%s", recorder.Code, http.StatusNoContent, recorder.Body.String())
+	}
+
 	if err := userController.TerminateSession(91001, tokens.auth); err != nil {
 		t.Fatalf("terminate origin session: %v", err)
 	}
@@ -191,6 +221,7 @@ func setupAuthRouteTest(t *testing.T) (*gin.Engine, authRouteTestTokens, *userco
 		auth:   "auth-route-test-auth-token",
 		photos: "auth-route-test-photos-token",
 		locker: "auth-route-test-locker-token",
+		drive:  "auth-route-test-drive-token",
 	}
 	authCache := cache.New(time.Minute, time.Minute)
 	userController := &usercontroller.UserController{
@@ -201,6 +232,7 @@ func setupAuthRouteTest(t *testing.T) (*gin.Engine, authRouteTestTokens, *userco
 	addTokenForTest(t, userAuthRepo, userID, ente.Auth, tokens.auth)
 	addTokenForTest(t, userAuthRepo, userID, ente.Photos, tokens.photos)
 	addTokenForTest(t, userAuthRepo, userID, ente.Locker, tokens.locker)
+	addTokenForTest(t, userAuthRepo, userID, ente.Drive, tokens.drive)
 	var err error
 	tokens.family, err = userController.GetSessionJWTToken(userID, jwt.FAMILIES, tokens.auth, ente.Auth)
 	if err != nil {

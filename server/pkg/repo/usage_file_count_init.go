@@ -60,7 +60,7 @@ func (repo *UsageRepository) readFileCountInitSnapshot(ctx context.Context, user
 				JOIN collection_files AS cf ON cf.file_id = f.file_id AND cf.is_deleted = FALSE
 				JOIN collections AS c ON c.collection_id = cf.collection_id
 				GROUP BY f.file_id
-				HAVING COUNT(DISTINCT c.app) > 1 OR BOOL_OR(c.app NOT IN ('photos', 'locker'))
+				HAVING COUNT(DISTINCT c.app) > 1 OR BOOL_OR(c.app NOT IN ('photos', 'locker', 'drive'))
 			) THEN 'cross-app or unsupported app memberships'
 			WHEN EXISTS (
 				SELECT 1 FROM owned_files AS f

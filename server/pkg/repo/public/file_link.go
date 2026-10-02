@@ -19,6 +19,7 @@ type FileLinkRepository struct {
 	DB         *sql.DB
 	photoHost  string
 	lockerHost string
+	driveHost  string
 }
 
 type fileLinkUpdater interface {
@@ -34,16 +35,25 @@ func NewFileLinkRepo(db *sql.DB) *FileLinkRepository {
 	if lockerHost == "" {
 		lockerHost = "https://share.ente.com"
 	}
+	// Drive links are served by the Locker share app unless configured otherwise.
+	driveHost := viper.GetString("apps.public-drive")
+	if driveHost == "" {
+		driveHost = lockerHost
+	}
 	return &FileLinkRepository{
 		DB:         db,
 		photoHost:  albumHost,
 		lockerHost: lockerHost,
+		driveHost:  driveHost,
 	}
 }
 
 func (pcr *FileLinkRepository) FileLink(app ente.App, token string) string {
-	if app == ente.Locker {
+	switch app {
+	case ente.Locker:
 		return fmt.Sprintf("%s/%s", pcr.lockerHost, token)
+	case ente.Drive:
+		return fmt.Sprintf("%s/%s", pcr.driveHost, token)
 	}
 	return fmt.Sprintf("%s/file/?t=%s", pcr.photoHost, token)
 }

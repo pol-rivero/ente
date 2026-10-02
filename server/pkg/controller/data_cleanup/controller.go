@@ -148,6 +148,10 @@ func (c *DeleteUserCleanupController) emptyTrash(ctx context.Context, item *enti
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	err = c.TrashRepo.EmptyTrash(ctx, item.UserID, time.Microseconds(), ente.Drive)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
 	// schedule storage consumed check for the user after 60min. Trash should ideally get emptied after 60 min
 	return c.Repo.MoveToNextStage(ctx, item.UserID, entity.Storage, time.MicrosecondsAfterMinutes(60))
 }
@@ -189,6 +193,10 @@ func (c *DeleteUserCleanupController) storageCheck(ctx context.Context, item *en
 				return stacktrace.Propagate(err, "")
 			}
 			err = c.TrashRepo.EmptyTrash(ctx, item.UserID, *timeStamp, ente.Locker)
+			if err != nil {
+				return stacktrace.Propagate(err, "")
+			}
+			err = c.TrashRepo.EmptyTrash(ctx, item.UserID, *timeStamp, ente.Drive)
 			if err != nil {
 				return stacktrace.Propagate(err, "")
 			}

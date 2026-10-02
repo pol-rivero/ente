@@ -46,6 +46,8 @@ apps:
     public-albums: http://localhost:3002
     embed-albums: http://localhost:3006
     public-locker: http://localhost:3005
+    # Ente Drive public links; defaults to public-locker when unset.
+    # public-drive: http://localhost:3005
     public-paste: http://localhost:3008
     cast: http://localhost:3004
     accounts: http://localhost:3001

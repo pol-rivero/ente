@@ -84,6 +84,10 @@ func GetApp(c *gin.Context) ente.App {
 		return ente.Locker
 	}
 
+	if strings.HasPrefix(c.GetHeader("X-Client-Package"), "io.ente.drive") {
+		return ente.Drive
+	}
+
 	return ente.Photos
 }
 

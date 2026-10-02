@@ -472,8 +472,11 @@ order by updated_at ASC limit $2
 func (t *TrashRepository) EmptyTrash(ctx context.Context, userID int64, lastUpdatedAt int64, app ente.App) error {
 	itemID := fmt.Sprintf("%d%s%d", userID, EmptyTrashQueueItemSeparator, lastUpdatedAt)
 	queueName := TrashEmptyQueue
-	if app == ente.Locker {
+	switch app {
+	case ente.Locker:
 		queueName = TrashEmptyLockerQueue
+	case ente.Drive:
+		queueName = TrashEmptyDriveQueue
 	}
 	return t.QueueRepo.InsertItem(ctx, queueName, itemID)
 }

@@ -61,7 +61,7 @@ func (c *UserController) GetDetailsV2(ctx *gin.Context, userID int64, fetchMemor
 		switch app {
 		case ente.Locker:
 			lockerUsage, err = c.UsageRepo.GetLockerUsage(ctx, subscriptionUserIDs)
-		case ente.Photos:
+		case ente.Photos, ente.Drive:
 			lockerUsage, err = c.UsageRepo.GetLockerStorageUsage(ctx, subscriptionUserIDs)
 		}
 		if err != nil {

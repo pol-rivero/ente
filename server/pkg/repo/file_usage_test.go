@@ -19,6 +19,9 @@ func TestUpdateUsageForFileCreationMaintainsCounterState(t *testing.T) {
 	}{
 		{name: "ready_photos", app: ente.Photos, ready: true},
 		{name: "legacy_photos", app: ente.Photos},
+		{name: "ready_locker", app: ente.Locker, ready: true},
+		{name: "ready_drive", app: ente.Drive, ready: true},
+		{name: "legacy_drive", app: ente.Drive},
 	}
 
 	for i, tt := range tests {
@@ -61,11 +64,25 @@ func TestUpdateUsageForFileCreationMaintainsCounterState(t *testing.T) {
 				t.Fatalf("storage = (%d, %d), want %d", usage, storage, wantStorage)
 			}
 			if tt.ready {
-				if !photos.Valid || photos.Int64 != 3 || !locker.Valid || locker.Int64 != 3 || version != 8 {
-					t.Fatalf("counter state = (%v, %v, %d), want (3, 3, 8)", photos, locker, version)
+				// Drive files aren't counted, so the counters and their version stay put.
+				wantPhotos, wantLocker, wantVersion := int64(2), int64(3), int64(7)
+				switch tt.app {
+				case ente.Photos:
+					wantPhotos, wantVersion = 3, 8
+				case ente.Locker:
+					wantLocker, wantVersion = 4, 8
 				}
-			} else if photos.Valid || locker.Valid || version != 1 {
-				t.Fatalf("counter state = (%v, %v, %d), want (NULL, NULL, 1)", photos, locker, version)
+				if !photos.Valid || photos.Int64 != wantPhotos || !locker.Valid || locker.Int64 != wantLocker || version != wantVersion {
+					t.Fatalf("counter state = (%v, %v, %d), want (%d, %d, %d)", photos, locker, version, wantPhotos, wantLocker, wantVersion)
+				}
+			} else {
+				wantVersion := int64(1)
+				if tt.app == ente.Drive {
+					wantVersion = 0
+				}
+				if photos.Valid || locker.Valid || version != wantVersion {
+					t.Fatalf("counter state = (%v, %v, %d), want (NULL, NULL, %d)", photos, locker, version, wantVersion)
+				}
 			}
 		})
 	}

@@ -18,35 +18,66 @@ import (
 )
 
 func TestFileRegistrationStoresApp(t *testing.T) {
-	_, fileRepo, db := setupObjectCleanupRaceTest(t, "http://127.0.0.1")
-	ownerID := testutil.InsertUser(t, db, testutil.UserFixture{
-		UserID:       1,
-		Email:        "file-app-owner@ente.com",
-		CreationTime: 1,
-	})
-	testutil.InsertUsage(t, db, ownerID, 0)
-	collectionID := insertObjectCleanupTestCollection(t, db, ownerID)
-	const fileObjectKey = "1/file-app-file"
-	const thumbnailObjectKey = "1/file-app-thumbnail"
-	if _, err := db.Exec(`
-		INSERT INTO temp_objects(object_key, expiration_time, bucket_id)
-		VALUES ($1, 0, 'b2-eu-cen'), ($2, 0, 'b2-eu-cen')`, fileObjectKey, thumbnailObjectKey); err != nil {
-		t.Fatalf("failed to stage objects: %v", err)
-	}
+	for _, tt := range []struct {
+		app                    ente.App
+		wantPhotos, wantLocker int64
+		wantVersion            int64
+	}{
+		{app: ente.Photos, wantPhotos: 3, wantLocker: 3, wantVersion: 1},
+		{app: ente.Locker, wantPhotos: 2, wantLocker: 4, wantVersion: 1},
+		// Drive files share the storage quota but aren't counted.
+		{app: ente.Drive, wantPhotos: 2, wantLocker: 3, wantVersion: 0},
+	} {
+		t.Run(string(tt.app), func(t *testing.T) {
+			_, fileRepo, db := setupObjectCleanupRaceTest(t, "http://127.0.0.1")
+			ownerID := testutil.InsertUser(t, db, testutil.UserFixture{
+				UserID:       1,
+				Email:        "file-app-owner@ente.com",
+				CreationTime: 1,
+			})
+			testutil.InsertUsage(t, db, ownerID, 0)
+			if _, err := db.Exec(`UPDATE usage SET photos_file_count = 2, locker_file_count = 3 WHERE user_id = $1`, ownerID); err != nil {
+				t.Fatal(err)
+			}
+			collectionID := insertObjectCleanupTestCollection(t, db, ownerID)
+			if _, err := db.Exec(`UPDATE collections SET app = $1 WHERE collection_id = $2`, tt.app, collectionID); err != nil {
+				t.Fatal(err)
+			}
+			const fileObjectKey = "1/file-app-file"
+			const thumbnailObjectKey = "1/file-app-thumbnail"
+			if _, err := db.Exec(`
+				INSERT INTO temp_objects(object_key, expiration_time, bucket_id)
+				VALUES ($1, 0, 'b2-eu-cen'), ($2, 0, 'b2-eu-cen')`, fileObjectKey, thumbnailObjectKey); err != nil {
+				t.Fatalf("failed to stage objects: %v", err)
+			}
 
-	file, _, err := fileRepo.Create(objectCleanupTestFile(
-		ownerID, collectionID, fileObjectKey, thumbnailObjectKey,
-	), 100, 10, 110, ownerID, ente.Photos)
-	if err != nil {
-		t.Fatal(err)
-	}
+			file, usage, err := fileRepo.Create(objectCleanupTestFile(
+				ownerID, collectionID, fileObjectKey, thumbnailObjectKey,
+			), 100, 10, 110, ownerID, tt.app)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if usage != 110 {
+				t.Fatalf("usage = %d, want 110", usage)
+			}
 
-	var app string
-	if err := db.QueryRow(`SELECT app FROM files WHERE file_id = $1`, file.ID).Scan(&app); err != nil {
-		t.Fatal(err)
-	}
-	if app != string(ente.Photos) {
-		t.Fatalf("file app = %q, want %q", app, ente.Photos)
+			var app string
+			if err := db.QueryRow(`SELECT app FROM files WHERE file_id = $1`, file.ID).Scan(&app); err != nil {
+				t.Fatal(err)
+			}
+			if app != string(tt.app) {
+				t.Fatalf("file app = %q, want %q", app, tt.app)
+			}
+			var photos, locker, version int64
+			if err := db.QueryRow(`SELECT photos_file_count, locker_file_count, file_count_source_version
+				FROM usage WHERE user_id = $1`, ownerID).Scan(&photos, &locker, &version); err != nil {
+				t.Fatal(err)
+			}
+			if photos != tt.wantPhotos || locker != tt.wantLocker || version != tt.wantVersion {
+				t.Fatalf("file counts = (%d, %d, %d), want (%d, %d, %d)",
+					photos, locker, version, tt.wantPhotos, tt.wantLocker, tt.wantVersion)
+			}
+		})
 	}
 }
 

@@ -305,8 +305,8 @@ func (c *UserController) resetUserAccess(ctx context.Context, userID int64, logg
 		}
 	}
 
-	logger.Info("remove locker and photos tokens for user")
-	if err := c.RemoveTokensForApps(userID, []ente.App{ente.Locker, ente.Photos}); err != nil {
+	logger.Info("remove locker, photos and drive tokens for user")
+	if err := c.RemoveTokensForApps(userID, []ente.App{ente.Locker, ente.Photos, ente.Drive}); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
 

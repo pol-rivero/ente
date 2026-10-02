@@ -83,6 +83,9 @@ func fileCountDelta(app ente.App, delta int64) (photos int64, locker int64, ok b
 		return delta, 0, true
 	case ente.Locker:
 		return 0, delta, true
+	case ente.Drive:
+		// Drive files aren't counted; quota is shared with Photos by size.
+		return 0, 0, true
 	default:
 		return 0, 0, false
 	}
@@ -100,8 +103,8 @@ func activeOwnedFileCountDeltas(ctx context.Context, tx *sql.Tx, userID int64, f
 			-COUNT(*) FILTER (WHERE app = $3),
 			-COUNT(*) FILTER (WHERE app = $4),
 			COUNT(*) <> COUNT(DISTINCT file_id)
-				OR COUNT(*) FILTER (WHERE app IS NULL OR app NOT IN ($3, $4)) > 0
-		FROM active_apps`, userID, pq.Array(fileIDs), ente.Photos, ente.Locker).Scan(&photos, &locker, &ambiguous)
+				OR COUNT(*) FILTER (WHERE app IS NULL OR app NOT IN ($3, $4, $5)) > 0
+		FROM active_apps`, userID, pq.Array(fileIDs), ente.Photos, ente.Locker, ente.Drive).Scan(&photos, &locker, &ambiguous)
 	if err != nil {
 		return 0, 0, false, stacktrace.Propagate(err, "")
 	}

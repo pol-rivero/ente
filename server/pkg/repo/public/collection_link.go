@@ -18,6 +18,7 @@ type CollectionLinkRepo struct {
 	DB         *sql.DB
 	albumHost  string
 	lockerHost string
+	driveHost  string
 }
 
 func NewCollectionLinkRepository(db *sql.DB, albumHost string) *CollectionLinkRepo {
@@ -28,16 +29,25 @@ func NewCollectionLinkRepository(db *sql.DB, albumHost string) *CollectionLinkRe
 	if lockerHost == "" {
 		lockerHost = "https://share.ente.com"
 	}
+	// Drive links are served by the Locker share app unless configured otherwise.
+	driveHost := viper.GetString("apps.public-drive")
+	if driveHost == "" {
+		driveHost = lockerHost
+	}
 	return &CollectionLinkRepo{
 		DB:         db,
 		albumHost:  albumHost,
 		lockerHost: lockerHost,
+		driveHost:  driveHost,
 	}
 }
 
 func (pcr *CollectionLinkRepo) GetAlbumUrl(app ente.App, token string) string {
-	if app == ente.Locker {
+	switch app {
+	case ente.Locker:
 		return fmt.Sprintf("%s/c/%s", pcr.lockerHost, token)
+	case ente.Drive:
+		return fmt.Sprintf("%s/c/%s", pcr.driveHost, token)
 	}
 	return fmt.Sprintf("%s/?t=%s", pcr.albumHost, token)
 }

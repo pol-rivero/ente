@@ -230,6 +230,12 @@ var ErrFileInTrash = ApiError{
 	HttpStatusCode: http.StatusConflict,
 }
 
+var ErrCrossAppFile = ApiError{
+	Code:           CrossAppFile,
+	Message:        "Files and collections of different apps can't be mixed",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
 var ErrLockerRegistrationDisabled = &ApiError{
 	Code:           LockerRegistrationDisabled,
 	Message:        "Locker is restricted to paid users currently",
@@ -282,6 +288,8 @@ const (
 	FileLimitReached ErrorCode = "FILE_LIMIT_REACHED"
 
 	FileInTrash ErrorCode = "FILE_IN_TRASH"
+
+	CrossAppFile ErrorCode = "CROSS_APP_FILE"
 
 	SessionExpired ErrorCode = "SESSION_EXPIRED"
 

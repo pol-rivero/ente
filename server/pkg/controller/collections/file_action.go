@@ -1,6 +1,8 @@
 package collections
 
 import (
+	"slices"
+
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/pkg/controller/access"
 	"github.com/ente/museum/pkg/utils/auth"
@@ -44,6 +46,9 @@ func (c *CollectionController) AddFiles(ctx *gin.Context, userID int64, files []
 	if err != nil {
 		return stacktrace.Propagate(err, "Failed to verify fileOwnership")
 	}
+	if err := c.validateFileApps(ctx, ente.App(resp.Collection.App), fileIDs); err != nil {
+		return err
+	}
 
 	err = c.CollectionRepo.AddFiles(ctx.Request.Context(), cID, collectionOwnerID, files, filesOwnerID)
 	if err != nil {
@@ -56,7 +61,7 @@ func (c *CollectionController) RestoreFiles(ctx *gin.Context, userID int64, cID 
 	if err := validateCollectionFileItems(files); err != nil {
 		return err
 	}
-	_, err := c.AccessCtrl.GetCollection(ctx, &access.GetCollectionParams{
+	resp, err := c.AccessCtrl.GetCollection(ctx, &access.GetCollectionParams{
 		CollectionID:   cID,
 		ActorUserID:    userID,
 		IncludeDeleted: false,
@@ -65,6 +70,12 @@ func (c *CollectionController) RestoreFiles(ctx *gin.Context, userID int64, cID 
 	if err != nil {
 		return stacktrace.Propagate(err, "failed to verify collection access")
 	}
+	collectionApp := ente.App(resp.Collection.App)
+	app := auth.GetApp(ctx)
+	if (app == ente.Drive || collectionApp == ente.Drive) && app != collectionApp {
+		return stacktrace.Propagate(&ente.ErrCrossAppFile, "app mismatch collection: %s  request ctx app %s", collectionApp, app)
+	}
+	fileIDs := make([]int64, 0, len(files))
 	for _, file := range files {
 		// todo #perf find owners of all files
 		ownerID, err := c.FileRepo.GetOwnerID(file.ID)
@@ -79,10 +90,33 @@ func (c *CollectionController) RestoreFiles(ctx *gin.Context, userID int64, cID 
 			}).Error("invalid ops: can't add file which isn't owned by user")
 			return stacktrace.Propagate(ente.ErrPermissionDenied, "")
 		}
+		fileIDs = append(fileIDs, file.ID)
+	}
+	if err := c.validateFileApps(ctx, collectionApp, fileIDs); err != nil {
+		return err
 	}
 	err = c.CollectionRepo.RestoreFiles(ctx.Request.Context(), userID, cID, files)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
+	}
+	return nil
+}
+
+// validateFileApps keeps Drive files and Drive collections from crossing into
+// other apps. Files without a stored app predate files.app and count as Photos.
+// Photos/Locker combinations are left unchecked to preserve existing behaviour.
+func (c *CollectionController) validateFileApps(ctx *gin.Context, collectionApp ente.App, fileIDs []int64) error {
+	fileApps, err := c.FileRepo.GetDistinctFileApps(ctx.Request.Context(), fileIDs)
+	if err != nil {
+		return stacktrace.Propagate(err, "failed to get file apps")
+	}
+	if collectionApp != ente.Drive && !slices.Contains(fileApps, ente.Drive) {
+		return nil
+	}
+	for _, fileApp := range fileApps {
+		if fileApp != collectionApp {
+			return stacktrace.Propagate(&ente.ErrCrossAppFile, "file app %s doesn't match collection app %s", fileApp, collectionApp)
+		}
 	}
 	return nil
 }
@@ -129,6 +163,9 @@ func (c *CollectionController) MoveFiles(ctx *gin.Context, req ente.MoveFilesReq
 	})
 	if err != nil {
 		return stacktrace.Propagate(err, "Failed to verify fileOwnership")
+	}
+	if err := c.validateFileApps(ctx, ente.App(r2.Collection.App), fileIDs); err != nil {
+		return err
 	}
 
 	err = c.CollectionRepo.MoveFiles(ctx.Request.Context(), req.ToCollectionID, req.FromCollectionID, req.Files, userID, userID)

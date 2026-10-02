@@ -26,6 +26,7 @@ var itemDeletionDelayInMinMap = map[string]int64{
 	TrashCollectionQueueV3:    -1 * 24 * 60,
 	TrashEmptyQueue:           -1 * 24 * 60,
 	TrashEmptyLockerQueue:     -1 * 24 * 60,
+	TrashEmptyDriveQueue:      -1 * 24 * 60,
 	RemoveComplianceHoldQueue: -1 * 24 * 60,
 }
 
@@ -40,6 +41,7 @@ const (
 	TrashCollectionQueueV3    string = "trashCollectionV3"
 	TrashEmptyQueue           string = "trashEmpty"
 	TrashEmptyLockerQueue     string = "trashEmptyLocker"
+	TrashEmptyDriveQueue      string = "trashEmptyDrive"
 	RemoveComplianceHoldQueue string = "removeComplianceHold"
 	BatchSize                 int    = 30000
 )

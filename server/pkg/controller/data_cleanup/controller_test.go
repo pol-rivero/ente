@@ -1,6 +1,7 @@
 package data_cleanup
 
 import (
+	"strings"
 	"testing"
 
 	cleanupentity "github.com/ente/museum/ente/data_cleanup"
@@ -66,5 +67,43 @@ func TestStartCleanupCancelsRecoveredAccount(t *testing.T) {
 				t.Fatalf("cleanup row count = %d, want 0", cleanupRows)
 			}
 		})
+	}
+}
+
+func TestEmptyTrashStageQueuesEveryStorageApp(t *testing.T) {
+	testutil.WithServerRoot(t)
+	db := testutil.RequireTestDB(t)
+	reset := func() {
+		if _, err := db.Exec(`DELETE FROM data_cleanup`); err != nil {
+			t.Errorf("failed to clear data_cleanup: %v", err)
+		}
+		if _, err := db.Exec(`TRUNCATE TABLE queue RESTART IDENTITY`); err != nil {
+			t.Errorf("failed to clear queue: %v", err)
+		}
+		testutil.ResetTables(t, db)
+	}
+	reset()
+	t.Cleanup(reset)
+	userID := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 83, Email: "deleted@example.com", CreationTime: 1})
+	if _, err := db.Exec(`INSERT INTO data_cleanup(user_id) VALUES($1)`, userID); err != nil {
+		t.Fatalf("failed to insert cleanup row: %v", err)
+	}
+	queueRepo := &repo.QueueRepository{DB: db}
+	controller := &DeleteUserCleanupController{
+		Repo:      &cleanuprepo.Repository{DB: db},
+		TrashRepo: &repo.TrashRepository{DB: db, QueueRepo: queueRepo},
+	}
+
+	if err := controller.emptyTrash(t.Context(), &cleanupentity.DataCleanup{UserID: userID, Stage: cleanupentity.Trash}); err != nil {
+		t.Fatalf("emptyTrash() error = %v", err)
+	}
+	for _, queueName := range []string{repo.TrashEmptyQueue, repo.TrashEmptyLockerQueue, repo.TrashEmptyDriveQueue} {
+		items, err := queueRepo.GetItemsReadyForDeletion(queueName, 10)
+		if err != nil {
+			t.Fatalf("GetItemsReadyForDeletion(%s) error = %v", queueName, err)
+		}
+		if len(items) != 1 || !strings.HasPrefix(items[0].Item, "83"+repo.EmptyTrashQueueItemSeparator) {
+			t.Fatalf("%s items = %+v, want one item for user %d", queueName, items, userID)
+		}
 	}
 }

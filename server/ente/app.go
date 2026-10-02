@@ -6,11 +6,12 @@ const (
 	Photos App = "photos"
 	Auth   App = "auth"
 	Locker App = "locker"
+	Drive  App = "drive"
 )
 
 func (a App) IsValid() bool {
 	switch a {
-	case Photos, Auth, Locker:
+	case Photos, Auth, Locker, Drive:
 		return true
 	}
 	return false
@@ -18,7 +19,7 @@ func (a App) IsValid() bool {
 
 func (a App) IsValidForCollection() bool {
 	switch a {
-	case Photos, Locker:
+	case Photos, Locker, Drive:
 		return true
 	}
 	return false

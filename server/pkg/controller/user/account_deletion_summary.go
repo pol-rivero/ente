@@ -6,6 +6,7 @@ import (
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/ente/details"
 	"github.com/ente/stacktrace"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -13,6 +14,7 @@ func (c *UserController) GetAccountDeletionSummary(ctx context.Context, userID i
 	var photosAndVideosCount int64
 	var authenticatorCodesCount int64
 	var lockerRecordsCount int64
+	var driveFilesCount int64
 
 	g := new(errgroup.Group)
 	g.Go(func() error {
@@ -32,6 +34,16 @@ func (c *UserController) GetAccountDeletionSummary(ctx context.Context, userID i
 		return nil
 	})
 	g.Go(func() error {
+		// Best effort: a Drive count failure must not break the summary for other apps.
+		count, err := c.UserCacheController.GetUserFileCountWithCache(userID, ente.Drive)
+		if err != nil {
+			log.WithError(err).WithField("user_id", userID).Error("failed to get drive file count")
+			return nil
+		}
+		driveFilesCount = count
+		return nil
+	})
+	g.Go(func() error {
 		count, err := c.AuthenticatorRepo.GetAuthCodeCount(ctx, userID)
 		if err != nil {
 			return stacktrace.Propagate(err, "failed to get authenticator code count")
@@ -48,5 +60,6 @@ func (c *UserController) GetAccountDeletionSummary(ctx context.Context, userID i
 		PhotosAndVideosCount:    photosAndVideosCount,
 		AuthenticatorCodesCount: authenticatorCodesCount,
 		LockerRecordsCount:      lockerRecordsCount,
+		DriveFilesCount:         driveFilesCount,
 	}, nil
 }

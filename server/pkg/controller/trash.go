@@ -130,10 +130,19 @@ func (t *TrashController) ProcessEmptyTrashRequests() {
 	itemsLocker, err2 := t.QueueRepo.GetItemsReadyForDeletion(repo.TrashEmptyLockerQueue, 100)
 	if err2 != nil {
 		log.Error("Could not fetch from emptyTrashLockerQueue queue", err2)
+	} else {
+		for _, item := range itemsLocker {
+			t.emptyTrash(item, ente.Locker, repo.TrashEmptyLockerQueue)
+		}
+	}
+
+	itemsDrive, err3 := t.QueueRepo.GetItemsReadyForDeletion(repo.TrashEmptyDriveQueue, 100)
+	if err3 != nil {
+		log.Error("Could not fetch from emptyTrashDriveQueue queue", err3)
 		return
 	}
-	for _, item := range itemsLocker {
-		t.emptyTrash(item, ente.Locker, repo.TrashEmptyLockerQueue)
+	for _, item := range itemsDrive {
+		t.emptyTrash(item, ente.Drive, repo.TrashEmptyDriveQueue)
 	}
 }
 
