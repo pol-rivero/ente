@@ -32,6 +32,14 @@ func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, e
 	return stacktrace.Propagate(err, "")
 }
 
+func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, objectKey string, userID int64) error {
+	_, err := repo.DB.ExecContext(ctx, `
+		UPDATE temp_objects SET expiration_time = $1
+		WHERE object_key = $2 AND user_id = $3 AND expiration_time > $1`,
+		time.Microseconds(), objectKey, userID)
+	return stacktrace.Propagate(err, "")
+}
+
 func (repo *ObjectCleanupRepository) RemoveTempObjectKey(ctx context.Context, tx *sql.Tx, objectKey string, dc string) error {
 	res, err := tx.ExecContext(ctx, `DELETE FROM temp_objects WHERE object_key = $1`, objectKey)
 	if err != nil {

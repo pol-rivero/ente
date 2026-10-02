@@ -59,7 +59,7 @@ func TestPendingUploadMetadata(t *testing.T) {
 				} else {
 					upload, err = controller.GetMultipartUploadURLWithMetadata(t.Context(), userID, ente.MultipartUploadURLRequest{
 						ContentLength: 5, PartLength: 5, PartMD5s: []string{checksum},
-					}, ente.Locker, client)
+					}, ente.Locker, client, false)
 				}
 				require.NoError(t, err)
 				require.Len(t, upload.PartURLs, 1)
@@ -71,7 +71,7 @@ func TestPendingUploadMetadata(t *testing.T) {
 			} else {
 				upload, err := controller.GetUploadURLWithMetadata(t.Context(), userID, ente.UploadURLRequest{
 					ContentLength: 5, ContentMD5: " " + checksum + " ",
-				}, ente.Locker, client)
+				}, ente.Locker, client, false)
 				require.NoError(t, err)
 				objectKey = upload.ObjectKey
 			}

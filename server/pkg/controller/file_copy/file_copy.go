@@ -181,7 +181,7 @@ func (fc *FileCopyController) createCopy(c *gin.Context, fcInternal fileCopyInte
 		return nil, err
 	}
 	file := fcInternal.newFile(userID)
-	newFile, err := fc.FileController.Create(c, userID, file, "", app)
+	newFile, err := fc.FileController.Create(c, userID, file, "", app, false)
 	if err != nil {
 		return nil, err
 	}

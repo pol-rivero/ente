@@ -51,7 +51,7 @@ func (h *FileHandler) CreateOrUpdate(c *gin.Context) {
 	if file.ID == 0 {
 		file.OwnerID = userID
 		file.IsDeleted = false
-		file, err := h.Controller.Create(c, userID, file, c.Request.UserAgent(), enteApp)
+		file, err := h.Controller.Create(c, userID, file, c.Request.UserAgent(), enteApp, false)
 		if err != nil {
 			handler.Error(c, stacktrace.Propagate(err, ""))
 			return
@@ -164,7 +164,7 @@ func (h *FileHandler) GetUploadURLV2(c *gin.Context) {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
 	}
-	url, err := h.Controller.GetUploadURLWithMetadata(c, userID, req, enteApp, network.GetClientInfo(c))
+	url, err := h.Controller.GetUploadURLWithMetadata(c, userID, req, enteApp, network.GetClientInfo(c), false)
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
@@ -195,7 +195,7 @@ func (h *FileHandler) GetMultipartUploadURLV2(c *gin.Context) {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
 	}
-	upload, err := h.Controller.GetMultipartUploadURLWithMetadata(c, userID, req, enteApp, network.GetClientInfo(c))
+	upload, err := h.Controller.GetMultipartUploadURLWithMetadata(c, userID, req, enteApp, network.GetClientInfo(c), false)
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
@@ -203,7 +203,13 @@ func (h *FileHandler) GetMultipartUploadURLV2(c *gin.Context) {
 	c.JSON(http.StatusOK, upload)
 }
 
+const legacyUploadsGoneMessage = "This upload API is no longer supported. Please update your app."
+
 func (h *FileHandler) RestrictLegacyUploads(c *gin.Context) {
+	if auth.GetApp(c) == ente.Drive {
+		c.AbortWithStatusJSON(http.StatusGone, gin.H{"error": legacyUploadsGoneMessage})
+		return
+	}
 	user, err := h.Controller.UserRepo.Get(auth.GetUserID(c.Request.Header))
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
@@ -211,7 +217,7 @@ func (h *FileHandler) RestrictLegacyUploads(c *gin.Context) {
 	}
 	cutoff := gTime.Date(2026, gTime.April, 1, 0, 0, 0, 0, gTime.UTC).UnixMicro()
 	if user.CreationTime >= cutoff || user.ID%2 == 0 {
-		c.AbortWithStatusJSON(http.StatusGone, gin.H{"error": "This upload API is no longer supported. Please update your app."})
+		c.AbortWithStatusJSON(http.StatusGone, gin.H{"error": legacyUploadsGoneMessage})
 	}
 }
 

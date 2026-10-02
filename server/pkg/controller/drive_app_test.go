@@ -43,7 +43,7 @@ func TestDriveUploadURLUsesSharedQuota(t *testing.T) {
 	const checksum = "XUFAKrxLKna5cZ2REBfFkg=="
 	request := ente.UploadURLRequest{ContentLength: 200 << 20, ContentMD5: checksum}
 
-	upload, err := controller.GetUploadURLWithMetadata(t.Context(), userID, request, ente.Drive, "io.ente.drive/1.0")
+	upload, err := controller.GetUploadURLWithMetadata(t.Context(), userID, request, ente.Drive, "io.ente.drive/1.0", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestDriveUploadURLUsesSharedQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, app := range []ente.App{ente.Photos, ente.Drive} {
-		_, err := controller.GetUploadURLWithMetadata(t.Context(), userID, request, app, "client")
+		_, err := controller.GetUploadURLWithMetadata(t.Context(), userID, request, app, "client", false)
 		if !errors.Is(err, ente.ErrStorageLimitExceeded) {
 			t.Fatalf("%s upload over quota error = %v, want %v", app, err, ente.ErrStorageLimitExceeded)
 		}
@@ -212,7 +212,7 @@ func TestFileCreateRequiresMatchingDriveCollection(t *testing.T) {
 		}
 		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx.Request = httptest.NewRequest(http.MethodPost, "/files", nil)
-		file, err := controller.Create(ctx, userID, objectCleanupTestFile(userID, collectionIDs[tt.collection], fileKey, thumbKey), "", tt.header)
+		file, err := controller.Create(ctx, userID, objectCleanupTestFile(userID, collectionIDs[tt.collection], fileKey, thumbKey), "", tt.header, false)
 		if tt.wantInvalidApp {
 			if !errors.Is(err, ente.ErrInvalidApp) {
 				t.Fatalf("%s header into %s collection: error = %v, want %v", tt.header, tt.collection, err, ente.ErrInvalidApp)

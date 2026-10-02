@@ -129,8 +129,15 @@ func (h *PublicCollectionHandler) GetCollection(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+func publicUploadApp(headerApp ente.App, collection ente.Collection) ente.App {
+	collectionApp := ente.App(collection.App)
+	if collectionApp != "" && (collectionApp == ente.Drive || headerApp == ente.Drive) {
+		return collectionApp
+	}
+	return headerApp
+}
+
 func (h *PublicCollectionHandler) GetUploadURLV2(c *gin.Context) {
-	enteApp := auth.GetApp(c)
 	var req ente.UploadURLRequest
 	if err := handler.BindJSON(c, &req); err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
@@ -141,7 +148,8 @@ func (h *PublicCollectionHandler) GetUploadURLV2(c *gin.Context) {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
 	}
-	url, err := h.FileCtrl.GetUploadURLWithMetadata(c, collection.Owner.ID, req, enteApp, network.GetClientInfo(c))
+	enteApp := publicUploadApp(auth.GetApp(c), collection)
+	url, err := h.FileCtrl.GetUploadURLWithMetadata(c, collection.Owner.ID, req, enteApp, network.GetClientInfo(c), true)
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
@@ -150,7 +158,6 @@ func (h *PublicCollectionHandler) GetUploadURLV2(c *gin.Context) {
 }
 
 func (h *PublicCollectionHandler) GetMultipartUploadURLV2(c *gin.Context) {
-	enteApp := auth.GetApp(c)
 	var req ente.MultipartUploadURLRequest
 	if err := handler.BindJSON(c, &req); err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
@@ -166,7 +173,8 @@ func (h *PublicCollectionHandler) GetMultipartUploadURLV2(c *gin.Context) {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
 	}
-	upload, err := h.FileCtrl.GetMultipartUploadURLWithMetadata(c, collection.Owner.ID, req, enteApp, network.GetClientInfo(c))
+	enteApp := publicUploadApp(auth.GetApp(c), collection)
+	upload, err := h.FileCtrl.GetMultipartUploadURLWithMetadata(c, collection.Owner.ID, req, enteApp, network.GetClientInfo(c), true)
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return

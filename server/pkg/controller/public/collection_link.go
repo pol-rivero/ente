@@ -109,7 +109,7 @@ func (c *CollectionLinkController) CreateFile(ctx *gin.Context, file ente.File, 
 	file.OwnerID = collectionOwnerID
 	file.UpdationTime = time.Microseconds()
 	file.IsDeleted = false
-	createdFile, err := c.FileController.Create(ctx, collectionOwnerID, file, ctx.Request.UserAgent(), app)
+	createdFile, err := c.FileController.Create(ctx, collectionOwnerID, file, ctx.Request.UserAgent(), app, true)
 	if err != nil {
 		return ente.File{}, stacktrace.Propagate(err, "")
 	}

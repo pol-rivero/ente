@@ -486,6 +486,15 @@ func (repo *FileRepository) GetOwnerID(fileID int64) (int64, error) {
 	return ownerID, stacktrace.Propagate(err, "failed to get file owner")
 }
 
+func (repo *FileRepository) GetOwnerIDAndApp(fileID int64) (int64, ente.App, error) {
+	row := repo.DB.QueryRow(`SELECT owner_id, COALESCE(app, 'photos') FROM files WHERE file_id = $1`,
+		fileID)
+	var ownerID int64
+	var app ente.App
+	err := row.Scan(&ownerID, &app)
+	return ownerID, app, stacktrace.Propagate(err, "failed to get file owner")
+}
+
 func (repo *FileRepository) GetOwnerToFileCountMap(ctx context.Context, fileIDs []int64) (map[int64]int64, error) {
 	rows, err := repo.DB.QueryContext(ctx, `SELECT owner_id, count(*) FROM files WHERE file_id = ANY($1) group by owner_id`,
 		pq.Array(fileIDs))

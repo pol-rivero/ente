@@ -65,6 +65,10 @@ const MaxFileSize = int64(1024 * 1024 * 1024 * 10)
 
 const InternalUserMaxFileSize = int64(1024 * 1024 * 1024 * 20)
 
+const DriveMaxFileSize = int64(10) << 30
+
+const DrivePublicMaxFileSize = int64(10) << 30
+
 const MaxUploadURLsLimit = 50
 
 const maxMultipartPartCount = 10000
@@ -72,24 +76,47 @@ const (
 	DeletedObjectQueueLock = "deleted_objects_queue_lock"
 )
 
-func (c *FileController) isFileSizeAllowed(ctx context.Context, userID int64, fileSize int64, app ente.App) (bool, error) {
+func (c *FileController) isFileSizeAllowed(ctx context.Context, userID int64, fileSize int64, app ente.App, publicUpload bool) (bool, int64, error) {
+	if app == ente.Drive {
+		limit := DriveMaxFileSize
+		if publicUpload {
+			limit = DrivePublicMaxFileSize
+		}
+		return fileSize <= limit, limit, nil
+	}
 	if fileSize <= MaxFileSize {
-		return true, nil
+		return true, MaxFileSize, nil
 	}
 	if fileSize > InternalUserMaxFileSize {
-		return false, nil
+		return false, MaxFileSize, nil
 	}
 	if app != ente.Photos {
-		return false, nil
+		return false, MaxFileSize, nil
 	}
 	value, err := c.RemoteStoreRepo.GetValue(ctx, userID, string(ente.IsInternalUser))
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return false, MaxFileSize, nil
 	}
 	if err != nil {
-		return false, stacktrace.Propagate(err, "failed to get internal user flag")
+		return false, MaxFileSize, stacktrace.Propagate(err, "failed to get internal user flag")
 	}
-	return value == "true", nil
+	return value == "true", MaxFileSize, nil
+}
+
+func contentLengthTooLargeError(app ente.App, limit int64) error {
+	if app == ente.Drive {
+		return stacktrace.Propagate(ente.NewBadRequestWithMessage(fmt.Sprintf("contentLength exceeds max file size %d", limit)), "")
+	}
+	return stacktrace.Propagate(ente.ErrBadRequest, "contentLength exceeds max file size %d", limit)
+}
+
+func tooManyPartsError(app ente.App, contentLength int64) error {
+	if app == ente.Drive {
+		minPartLength := (contentLength + maxMultipartPartCount - 1) / maxMultipartPartCount
+		return stacktrace.Propagate(ente.NewBadRequestWithMessage(fmt.Sprintf(
+			"multipart upload cannot exceed %d parts, partLength must be at least %d", maxMultipartPartCount, minPartLength)), "")
+	}
+	return stacktrace.Propagate(ente.ErrBadRequest, "multipart upload cannot exceed %d parts", maxMultipartPartCount)
 }
 
 func (c *FileController) validateFileCreateOrUpdateReq(userID int64, file ente.File, app ente.App) error {
@@ -140,7 +167,7 @@ type sizeResult struct {
 	err  error
 }
 
-func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, userAgent string, app ente.App) (ente.File, error) {
+func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, userAgent string, app ente.App, publicUpload bool) (ente.File, error) {
 	err := c.validateFileCreateOrUpdateReq(userID, file, app)
 	if err != nil {
 		return file, stacktrace.Propagate(err, "")
@@ -171,11 +198,15 @@ func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, 
 	}
 	fileSize := fileResult.size
 	thumbnailSize := thumbResult.size
-	isFileSizeAllowed, err := c.isFileSizeAllowed(ctx, userID, fileSize, app)
+	isFileSizeAllowed, _, err := c.isFileSizeAllowed(ctx, userID, fileSize, app, publicUpload)
 	if err != nil {
 		return file, stacktrace.Propagate(err, "")
 	}
 	if !isFileSizeAllowed {
+		// A public uploader acts as the owner and mustn't expire the owner's uploads.
+		if !publicUpload {
+			c.expireOversizedUpload(ctx, userID, file.File.ObjectKey)
+		}
 		return file, stacktrace.Propagate(ente.ErrFileTooLarge, "")
 	}
 
@@ -251,7 +282,7 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
 	}
-	ownerID, err := c.FileRepo.GetOwnerID(file.ID)
+	ownerID, fileApp, err := c.FileRepo.GetOwnerIDAndApp(file.ID)
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
 	}
@@ -259,6 +290,11 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 		return response, stacktrace.Propagate(ente.ErrPermissionDenied, "")
 	}
 	file.OwnerID = ownerID
+	// Photos/Locker cross-app updates keep the header app's limit, as before.
+	sizeApp := app
+	if app == ente.Drive || fileApp == ente.Drive {
+		sizeApp = fileApp
+	}
 	existingFileObject, err := c.ObjectRepo.GetObject(file.ID, ente.FILE)
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
@@ -275,11 +311,14 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
 	}
-	isFileSizeAllowed, err := c.isFileSizeAllowed(ctx, userID, fileSize, app)
+	isFileSizeAllowed, _, err := c.isFileSizeAllowed(ctx, userID, fileSize, sizeApp, false)
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
 	}
 	if !isFileSizeAllowed {
+		if file.File.ObjectKey != existingFileObjectKey {
+			c.expireOversizedUpload(ctx, userID, file.File.ObjectKey)
+		}
 		return response, stacktrace.Propagate(ente.ErrFileTooLarge, "")
 	}
 	if file.File.Size != 0 && file.File.Size != fileSize {
@@ -325,6 +364,16 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 	return response, nil
 }
 
+// Not for quota rejections: clients retry those with the same object after upgrading.
+func (c *FileController) expireOversizedUpload(ctx context.Context, userID int64, objectKey string) {
+	if err := c.ObjectCleanupRepo.ExpireTempObjectNow(context.WithoutCancel(ctx), objectKey, userID); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"user_id":    userID,
+			"object_key": objectKey,
+		}).Error("Failed to expire oversized upload")
+	}
+}
+
 func (c *FileController) GetUploadURLs(ctx context.Context, userID int64, count int, app ente.App, ignoreLimit bool, client string) ([]ente.UploadURL, error) {
 	err := c.UsageCtrl.CanUploadFile(ctx, userID, nil, app)
 	if err != nil {
@@ -363,16 +412,20 @@ func (c *FileController) ValidateUploadEligibility(ctx context.Context, userID i
 	return nil
 }
 
-func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID int64, req ente.UploadURLRequest, app ente.App, client string) (ente.UploadURL, error) {
+func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID int64, req ente.UploadURLRequest, app ente.App, client string, publicUpload bool) (ente.UploadURL, error) {
 	if req.ContentLength <= 0 {
 		return ente.UploadURL{}, stacktrace.Propagate(ente.ErrBadRequest, "contentLength must be greater than 0")
 	}
-	isFileSizeAllowed, err := c.isFileSizeAllowed(ctx, userID, req.ContentLength, app)
+	isFileSizeAllowed, limit, err := c.isFileSizeAllowed(ctx, userID, req.ContentLength, app, publicUpload)
 	if err != nil {
 		return ente.UploadURL{}, stacktrace.Propagate(err, "")
 	}
 	if !isFileSizeAllowed {
-		return ente.UploadURL{}, stacktrace.Propagate(ente.ErrBadRequest, "contentLength exceeds max file size %d", MaxFileSize)
+		return ente.UploadURL{}, contentLengthTooLargeError(app, limit)
+	}
+	if app == ente.Drive && req.ContentLength > ente.MaxMultipartPartSize {
+		return ente.UploadURL{}, stacktrace.Propagate(ente.NewBadRequestWithMessage(fmt.Sprintf(
+			"contentLength exceeds the single upload limit of %d bytes, use a multipart upload", ente.MaxMultipartPartSize)), "")
 	}
 	checksum, err := ente.NormalizeMD5(req.ContentMD5)
 	if err != nil {
@@ -1156,16 +1209,16 @@ func (c *FileController) GetMultipartUploadURLs(ctx context.Context, userID int6
 	return multipartUploadURLs, nil
 }
 
-func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, userID int64, req ente.MultipartUploadURLRequest, app ente.App, client string) (ente.MultipartUploadURLs, error) {
+func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, userID int64, req ente.MultipartUploadURLRequest, app ente.App, client string, publicUpload bool) (ente.MultipartUploadURLs, error) {
 	if req.ContentLength <= 0 {
 		return ente.MultipartUploadURLs{}, stacktrace.Propagate(ente.ErrBadRequest, "contentLength must be greater than 0")
 	}
-	isFileSizeAllowed, err := c.isFileSizeAllowed(ctx, userID, req.ContentLength, app)
+	isFileSizeAllowed, limit, err := c.isFileSizeAllowed(ctx, userID, req.ContentLength, app, publicUpload)
 	if err != nil {
 		return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
 	}
 	if !isFileSizeAllowed {
-		return ente.MultipartUploadURLs{}, stacktrace.Propagate(ente.ErrBadRequest, "contentLength exceeds max file size %d", MaxFileSize)
+		return ente.MultipartUploadURLs{}, contentLengthTooLargeError(app, limit)
 	}
 	if req.PartMD5s != nil && len(req.PartMD5s) == 0 {
 		return ente.MultipartUploadURLs{}, stacktrace.Propagate(ente.ErrBadRequest, "partMd5s must not be empty")
@@ -1175,7 +1228,7 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 	}
 	partCount := calculateMultipartPartCount(req.ContentLength, req.PartLength)
 	if partCount > maxMultipartPartCount {
-		return ente.MultipartUploadURLs{}, stacktrace.Propagate(ente.ErrBadRequest, "multipart upload cannot exceed %d parts", maxMultipartPartCount)
+		return ente.MultipartUploadURLs{}, tooManyPartsError(app, req.ContentLength)
 	}
 	var normalizedChecksums []string
 	if req.PartMD5s != nil {
@@ -1192,7 +1245,12 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 		}
 	}
 	partLengths := computePartLengths(req.ContentLength, req.PartLength, partCount)
-	if err := c.UsageCtrl.CanUploadFile(ctx, userID, nil, app); err != nil {
+	// Photos mobile doesn't handle a 426 here, so only Drive passes the size.
+	var uploadSize *int64
+	if app == ente.Drive {
+		uploadSize = &req.ContentLength
+	}
+	if err := c.UsageCtrl.CanUploadFile(ctx, userID, uploadSize, app); err != nil {
 		return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
 	}
 	s3Client := c.S3Config.GetHotS3Client()
