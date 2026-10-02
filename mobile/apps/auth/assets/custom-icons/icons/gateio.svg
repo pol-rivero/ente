@@ -1,6 +1,1 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2500 2500" xml:space="preserve">
-<rect y="0" fill="none" width="2500" height="2500"></rect>
-<path fill-rule="evenodd" clip-rule="evenodd" fill="#2354E6" d="M1250,1937.5c-379.7,0-687.5-307.8-687.5-687.5c0-379.7,307.8-687.5,687.5-687.5V0C559.6,0,0,559.6,0,1250c0,690.3,559.6,1250,1250,1250c690.3,0,1250-559.6,1250-1250h-562.5C1937.5,1629.7,1629.7,1937.5,1250,1937.5z"></path>
-<polygon fill-rule="evenodd" clip-rule="evenodd" fill="#17E6A1" points="1250,1250 1937.5,1250 1937.5,562.5 1250,562.5"></polygon>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 2500 2500" xml:space="preserve"><rect width="2500" height="2500" y="0" fill="none"/><path fill="#2354E6" fill-rule="evenodd" d="M1250,1937.5c-379.7,0-687.5-307.8-687.5-687.5c0-379.7,307.8-687.5,687.5-687.5V0C559.6,0,0,559.6,0,1250c0,690.3,559.6,1250,1250,1250c690.3,0,1250-559.6,1250-1250h-562.5C1937.5,1629.7,1629.7,1937.5,1250,1937.5z" clip-rule="evenodd"/><polygon fill="#17E6A1" fill-rule="evenodd" points="1250 1250 1937.5 1250 1937.5 562.5 1250 562.5" clip-rule="evenodd"/></svg>
