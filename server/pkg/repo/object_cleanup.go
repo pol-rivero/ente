@@ -70,6 +70,27 @@ func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, 
 	return nil
 }
 
+// Turns an unused single-PUT row into a pending multipart one, so a crash
+// after CreateMultipartUpload leaves a row whose upload the cron finds.
+func (repo *ObjectCleanupRepository) SetTempObjectPartLength(ctx context.Context, objectKey string, partLength int64, now int64) error {
+	res, err := repo.DB.ExecContext(ctx, `
+		UPDATE temp_objects SET part_length = $2
+		WHERE object_key = $1 AND upload_id IS NULL AND NOT is_multipart
+		  AND expiration_time > $3 AND NOT reservation_released`,
+		objectKey, partLength, now)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if rowsAffected != 1 {
+		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to set its part length", objectKey)
+	}
+	return nil
+}
+
 // The quota sum (UsageRepository.GetUsageWithDriveReservations) and admission
 // at Create must agree on which rows hold a reservation. $2 is now.
 const liveDriveReservation = `t.app = 'drive' AND t.purpose = 'file_upload'
@@ -104,6 +125,14 @@ func (repo *ObjectCleanupRepository) GetDriveReservedKeys(ctx context.Context, u
 
 func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, objectKey string, userID int64) error {
 	return expireTempObject(ctx, repo.DB, objectKey, userID, time.Microseconds())
+}
+
+func (repo *ObjectCleanupRepository) ReleaseTempObjects(ctx context.Context, objectKeys []string, userID int64, expirationTime int64) error {
+	_, err := repo.DB.ExecContext(ctx, `
+		UPDATE temp_objects SET expiration_time = $1, reservation_released = TRUE
+		WHERE object_key = ANY($2) AND user_id = $3 AND expiration_time > $4`,
+		expirationTime, pq.Array(objectKeys), userID, time.Microseconds())
+	return stacktrace.Propagate(err, "")
 }
 
 func (repo *ObjectCleanupRepository) ExpireLockedTempObject(ctx context.Context, tx *sql.Tx, objectKey string, userID int64, now int64) error {

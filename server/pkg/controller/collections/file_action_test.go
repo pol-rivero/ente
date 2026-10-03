@@ -36,7 +36,8 @@ func TestCollectionFileActionsRejectInvalidItems(t *testing.T) {
 		return controller.MoveFiles(nil, ente.MoveFilesRequest{FromCollectionID: 1, ToCollectionID: 2, Files: files})
 	}
 	copyFiles := func(files []ente.CollectionFileItem) error {
-		return controller.IsCopyAllowed(nil, 1, ente.CopyFileSyncRequest{SrcCollectionID: 1, DstCollection: 2, CollectionFileItems: files})
+		_, err := controller.IsCopyAllowed(nil, 1, ente.CopyFileSyncRequest{SrcCollectionID: 1, DstCollection: 2, CollectionFileItems: files})
+		return err
 	}
 	tests := []struct {
 		name    string

@@ -3,6 +3,7 @@ package repo
 import (
 	"database/sql"
 	"testing"
+	gotime "time"
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/internal/testutil"
@@ -143,4 +144,67 @@ func TestCleanupUpdatesMatchRowsByObjectKey(t *testing.T) {
 	var remaining int
 	require.NoError(t, tx.QueryRow(`SELECT COUNT(*) FROM temp_objects`).Scan(&remaining))
 	require.Zero(t, remaining)
+}
+
+func TestReleaseTempObjects(t *testing.T) {
+	_, db, userID := setupCollectionMembershipTest(t)
+	otherUserID := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 2, Email: "release-batch-other@ente.com", CreationTime: 1})
+	repo := &ObjectCleanupRepository{DB: db}
+	future := time.MicrosecondsAfterDays(14)
+	_, err := db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id) VALUES
+		('1/a', $1, 'b2-eu-cen', $2), ('1/b', $1, 'b2-eu-cen', $2), ('1/kept', $1, 'b2-eu-cen', $2),
+		('2/other', $1, 'b2-eu-cen', $3), ('1/expired', 5, 'b2-eu-cen', $2)`, future, userID, otherUserID)
+	require.NoError(t, err)
+	expiry := time.Microseconds() + gotime.Hour.Microseconds()
+
+	require.NoError(t, repo.ReleaseTempObjects(t.Context(), []string{"1/a", "1/b", "2/other", "1/expired", "1/missing"}, userID, expiry))
+
+	type state struct {
+		expiry   int64
+		released bool
+	}
+	rows, err := db.Query(`SELECT object_key, expiration_time, reservation_released FROM temp_objects`)
+	require.NoError(t, err)
+	defer rows.Close()
+	got := map[string]state{}
+	for rows.Next() {
+		var key string
+		var row state
+		require.NoError(t, rows.Scan(&key, &row.expiry, &row.released))
+		got[key] = row
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, map[string]state{
+		"1/a": {expiry, true}, "1/b": {expiry, true}, "1/kept": {future, false}, "2/other": {future, false}, "1/expired": {5, false},
+	}, got)
+}
+
+func TestSetTempObjectPartLength(t *testing.T) {
+	_, db, userID := setupCollectionMembershipTest(t)
+	repo := &ObjectCleanupRepository{DB: db}
+	now := time.Microseconds()
+	future := time.MicrosecondsAfterDays(14)
+	_, err := db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, purpose, is_multipart, upload_id, reservation_released) VALUES
+		('1/single', $1, 'b2-eu-cen', $2, 'photos', 'file_upload', FALSE, NULL, FALSE),
+		('1/multipart', $1, 'b2-eu-cen', $2, 'photos', 'file_upload', TRUE, 'u', FALSE),
+		('1/expired', 5, 'b2-eu-cen', $2, 'photos', 'file_upload', FALSE, NULL, FALSE),
+		('1/released', $1, 'b2-eu-cen', $2, 'drive', 'file_upload', FALSE, NULL, TRUE)`, future, userID)
+	require.NoError(t, err)
+
+	require.NoError(t, repo.SetTempObjectPartLength(t.Context(), "1/single", 10, now))
+	for _, key := range []string{"1/multipart", "1/expired", "1/released", "1/missing"} {
+		require.ErrorIs(t, repo.SetTempObjectPartLength(t.Context(), key, 10, now), ente.ErrUploadGone, key)
+	}
+	partLength := func(key string) sql.NullInt64 {
+		var length sql.NullInt64
+		require.NoError(t, db.QueryRow(`SELECT part_length FROM temp_objects WHERE object_key = $1`, key).Scan(&length))
+		return length
+	}
+	require.Equal(t, sql.NullInt64{Int64: 10, Valid: true}, partLength("1/single"))
+	require.False(t, partLength("1/multipart").Valid)
+
+	require.NoError(t, repo.SetTempObjectUploadID(t.Context(), "1/single", "upload", now))
+	var isMultipart bool
+	require.NoError(t, db.QueryRow(`SELECT is_multipart FROM temp_objects WHERE object_key = '1/single'`).Scan(&isMultipart))
+	require.True(t, isMultipart)
 }

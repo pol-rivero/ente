@@ -304,16 +304,16 @@ func (c *CollectionController) isRemoveAllowed(ctx *gin.Context,
 	return nil
 }
 
-func (c *CollectionController) IsCopyAllowed(ctx *gin.Context, actorUserID int64, req ente.CopyFileSyncRequest) error {
+func (c *CollectionController) IsCopyAllowed(ctx *gin.Context, actorUserID int64, req ente.CopyFileSyncRequest) (ente.App, error) {
 	if err := validateCollectionFileItems(req.CollectionFileItems); err != nil {
-		return err
+		return "", err
 	}
 	srcCollection, err := c.AccessCtrl.GetCollection(ctx, &access.GetCollectionParams{
 		CollectionID: req.SrcCollectionID,
 		ActorUserID:  actorUserID,
 	})
 	if err != nil {
-		return stacktrace.Propagate(err, "failed to verify srcCollection access")
+		return "", stacktrace.Propagate(err, "failed to verify srcCollection access")
 	}
 	dstCollection, err := c.AccessCtrl.GetCollection(ctx, &access.GetCollectionParams{
 		CollectionID: req.DstCollection,
@@ -321,24 +321,27 @@ func (c *CollectionController) IsCopyAllowed(ctx *gin.Context, actorUserID int64
 		VerifyOwner:  true,
 	})
 	if err != nil {
-		return stacktrace.Propagate(err, "failed to ownership of the dstCollection access")
+		return "", stacktrace.Propagate(err, "failed to ownership of the dstCollection access")
 	}
 	if srcCollection.Collection.App != dstCollection.Collection.App {
-		return stacktrace.Propagate(ente.ErrInvalidApp, "copy across app not supported %s to %s", srcCollection.Collection.App, dstCollection.Collection.App)
+		if srcCollection.Collection.App == string(ente.Drive) || dstCollection.Collection.App == string(ente.Drive) {
+			return "", stacktrace.Propagate(&ente.ErrCrossAppFile, "copy across app not supported %s to %s", srcCollection.Collection.App, dstCollection.Collection.App)
+		}
+		return "", stacktrace.Propagate(ente.ErrInvalidApp, "copy across app not supported %s to %s", srcCollection.Collection.App, dstCollection.Collection.App)
 	}
 	fileIDs := make([]int64, len(req.CollectionFileItems))
 	for idx, file := range req.CollectionFileItems {
 		fileIDs[idx] = file.ID
 	}
 	if err := c.CollectionRepo.VerifyAllFileIDsExistsInCollection(ctx, req.SrcCollectionID, fileIDs); err != nil {
-		return stacktrace.Propagate(err, "failed to verify fileIDs in srcCollection")
+		return "", stacktrace.Propagate(err, "failed to verify fileIDs in srcCollection")
 	}
 	dsMap, err := c.FileRepo.GetOwnerToFileIDsMap(ctx, fileIDs)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, ok := dsMap[actorUserID]; ok {
-		return ente.NewBadRequestWithMessage("can not copy files owned by actor")
+		return "", ente.NewBadRequestWithMessage("can not copy files owned by actor")
 	}
-	return nil
+	return ente.App(dstCollection.Collection.App), nil
 }

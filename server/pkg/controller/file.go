@@ -65,6 +65,7 @@ const MaxFileSize = int64(1024 * 1024 * 1024 * 10)
 
 const InternalUserMaxFileSize = int64(1024 * 1024 * 1024 * 20)
 
+// Interim until replication streams large objects (task 1.6 raises it to 5 000 GiB).
 const DriveMaxFileSize = int64(10) << 30
 
 const DrivePublicMaxFileSize = int64(10) << 30
@@ -508,9 +509,33 @@ func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID in
 }
 
 func (c *FileController) reserveDriveUpload(ctx context.Context, userID int64, object ente.TempObject) error {
-	return c.UsageCtrl.ReserveDriveUpload(ctx, userID, *object.ContentLength, func(ctx context.Context, tx *sql.Tx) error {
-		return c.ObjectCleanupCtrl.AddTempObjectTx(ctx, tx, object)
+	return c.ReserveDriveUploads(ctx, userID, []ente.TempObject{object})
+}
+
+func (c *FileController) ReserveDriveUploads(ctx context.Context, userID int64, objects []ente.TempObject) error {
+	var size int64
+	for _, object := range objects {
+		size += *object.ContentLength
+	}
+	return c.UsageCtrl.ReserveDriveUpload(ctx, userID, size, func(ctx context.Context, tx *sql.Tx) error {
+		for _, object := range objects {
+			if err := c.ObjectCleanupCtrl.AddTempObjectTx(ctx, tx, object); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+func (c *FileController) CheckFileSize(ctx context.Context, userID int64, fileSize int64, app ente.App) error {
+	allowed, limit, err := c.isFileSizeAllowed(ctx, userID, fileSize, app, false)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if !allowed {
+		return stacktrace.Propagate(ente.ErrFileTooLarge, "%d bytes exceed the limit of %d", fileSize, limit)
+	}
+	return nil
 }
 
 func (c *FileController) GetFileURL(ctx *gin.Context, userID int64, fileID int64) (string, error) {
