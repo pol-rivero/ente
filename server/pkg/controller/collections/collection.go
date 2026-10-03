@@ -51,6 +51,8 @@ func (c *CollectionController) Create(collection ente.Collection, ownerID int64)
 	if _, keyErr := c.UserRepo.GetKeyAttributes(ownerID); keyErr != nil {
 		return ente.Collection{}, stacktrace.Propagate(keyErr, "Unable to get keyAttributes")
 	}
+	// Parent fields are ignored until create-with-parent validation exists.
+	collection.ClearParent()
 	collectionType := collection.Type
 	app := collection.App
 	collection.Owner.ID = ownerID
@@ -95,6 +97,7 @@ func (c *CollectionController) GetCollection(ctx *gin.Context, userID int64, cID
 	}
 	if resp.Role != nil && *resp.Role != ente.OWNER {
 		collection.MagicMetadata = nil
+		collection.ClearParent()
 		collection.PublicURLs = ente.FilterPublicURLsForRole(collection.PublicURLs, *resp.Role)
 	}
 	return collection, nil

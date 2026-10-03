@@ -227,6 +227,7 @@ func (c *CollectionLinkController) GetPublicCollection(ctx *gin.Context, mustAll
 	// Don't expose private collection metadata through public links.
 	collection.Sharees = nil
 	collection.MagicMetadata = nil
+	collection.ClearParent()
 	publicURLsWithLimitedInfo := make([]ente.PublicURL, 0)
 	for _, publicUrl := range collection.PublicURLs {
 		publicURLsWithLimitedInfo = append(publicURLsWithLimitedInfo, ente.PublicURL{

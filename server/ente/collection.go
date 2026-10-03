@@ -29,6 +29,16 @@ type Collection struct {
 	PublicMagicMetadata *MagicMetadata       `json:"pubMagicMetadata,omitempty"`
 	// Per-sharee settings such as timeline visibility.
 	SharedMagicMetadata *MagicMetadata `json:"sharedMagicMetadata,omitempty"`
+	ParentID            *int64         `json:"parentID,omitempty"`
+	ParentEncryptedKey  *string        `json:"parentEncryptedKey,omitempty"`
+	ParentKeyNonce      *string        `json:"parentKeyNonce,omitempty"`
+}
+
+// Only the owner may see the folder tree.
+func (c *Collection) ClearParent() {
+	c.ParentID = nil
+	c.ParentEncryptedKey = nil
+	c.ParentKeyNonce = nil
 }
 
 func (c *Collection) AllowSharing() bool {

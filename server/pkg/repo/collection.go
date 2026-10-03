@@ -49,9 +49,12 @@ func (repo *CollectionRepository) Create(c ente.Collection) (ente.Collection, er
 		return ente.Collection{}, ente.ErrInvalidApp
 	}
 
-	err := repo.DB.QueryRow(`INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, magic_metadata, pub_magic_metadata, app) 
-        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING collection_id`,
-		c.Owner.ID, c.EncryptedKey, c.KeyDecryptionNonce, c.Name, c.EncryptedName, c.NameDecryptionNonce, c.Type, c.Attributes, c.UpdationTime, c.MagicMetadata, c.PublicMagicMetadata, c.App).Scan(&c.ID)
+	if c.ParentID == nil {
+		c.ClearParent()
+	}
+	err := repo.DB.QueryRow(`INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, magic_metadata, pub_magic_metadata, app, parent_id, parent_encrypted_key, parent_key_nonce) 
+        VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING collection_id`,
+		c.Owner.ID, c.EncryptedKey, c.KeyDecryptionNonce, c.Name, c.EncryptedName, c.NameDecryptionNonce, c.Type, c.Attributes, c.UpdationTime, c.MagicMetadata, c.PublicMagicMetadata, c.App, c.ParentID, c.ParentEncryptedKey, c.ParentKeyNonce).Scan(&c.ID)
 	if err != nil {
 		if err.Error() == "pq: duplicate key value violates unique constraint \"collections_favorites_constraint_index\"" ||
 			err.Error() == "pq: duplicate key value violates unique constraint \"collections_favorites_constraint_index_v2\"" {
@@ -63,15 +66,31 @@ func (repo *CollectionRepository) Create(c ente.Collection) (ente.Collection, er
 	return c, stacktrace.Propagate(err, "")
 }
 
+type collectionParentColumns struct {
+	id                     sql.NullInt64
+	encryptedKey, keyNonce sql.NullString
+}
+
+func (p collectionParentColumns) applyTo(c *ente.Collection) {
+	if !p.id.Valid {
+		return
+	}
+	c.ParentID = &p.id.Int64
+	c.ParentEncryptedKey = &p.encryptedKey.String
+	c.ParentKeyNonce = &p.keyNonce.String
+}
+
 func (repo *CollectionRepository) Get(collectionID int64) (ente.Collection, error) {
-	row := repo.DB.QueryRow(`SELECT collection_id, app, owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, is_deleted, magic_metadata, pub_magic_metadata
+	row := repo.DB.QueryRow(`SELECT collection_id, app, owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, is_deleted, magic_metadata, pub_magic_metadata, parent_id, parent_encrypted_key, parent_key_nonce
 		FROM collections
 		WHERE collection_id = $1`, collectionID)
 	var c ente.Collection
 	var name, encryptedName, nameDecryptionNonce sql.NullString
-	if err := row.Scan(&c.ID, &c.App, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata, &c.PublicMagicMetadata); err != nil {
+	var parent collectionParentColumns
+	if err := row.Scan(&c.ID, &c.App, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata, &c.PublicMagicMetadata, &parent.id, &parent.encryptedKey, &parent.keyNonce); err != nil {
 		return c, stacktrace.Propagate(err, "")
 	}
+	parent.applyTo(&c)
 	if name.Valid && len(name.String) > 0 {
 		c.Name = name.String
 	} else {
@@ -93,6 +112,9 @@ func (repo *CollectionRepository) Get(collectionID int64) (ente.Collection, erro
 }
 
 func (repo *CollectionRepository) WithSharingDetailsForUser(c ente.Collection, actorUserID int64) (ente.Collection, error) {
+	if actorUserID != c.Owner.ID {
+		c.ClearParent()
+	}
 	sharees, err := repo.GetSharees(c.ID)
 	if err != nil {
 		return ente.Collection{}, stacktrace.Propagate(err, "failed to get sharees info")
@@ -130,14 +152,16 @@ func (repo *CollectionRepository) WithSharingDetailsForUser(c ente.Collection, a
 	return c, nil
 }
 func (repo *CollectionRepository) GetCollectionByType(userID int64, collectionType string, app string) (ente.Collection, error) {
-	row := repo.DB.QueryRow(`SELECT collection_id, owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, is_deleted, magic_metadata
+	row := repo.DB.QueryRow(`SELECT collection_id, owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, is_deleted, magic_metadata, parent_id, parent_encrypted_key, parent_key_nonce
         FROM collections
         WHERE owner_id = $1 and type = $2 and app = $3`, userID, collectionType, app)
 	var c ente.Collection
 	var name, encryptedName, nameDecryptionNonce sql.NullString
-	if err := row.Scan(&c.ID, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata); err != nil {
+	var parent collectionParentColumns
+	if err := row.Scan(&c.ID, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata, &parent.id, &parent.encryptedKey, &parent.keyNonce); err != nil {
 		return c, stacktrace.Propagate(err, "")
 	}
+	parent.applyTo(&c)
 	if name.Valid && len(name.String) > 0 {
 		c.Name = name.String
 	} else {
@@ -150,7 +174,7 @@ func (repo *CollectionRepository) GetCollectionByType(userID int64, collectionTy
 func (repo *CollectionRepository) GetCollectionsOwnedByUserV2(userID int64, updationTime int64, app ente.App, limit *int64) ([]ente.Collection, error) {
 	query := `
 		SELECT 
-c.collection_id, c.owner_id, c.encrypted_key,c.key_decryption_nonce, c.name, c.encrypted_name, c.name_decryption_nonce, c.type, c.app, c.attributes, c.updation_time, c.is_deleted, c.magic_metadata, c.pub_magic_metadata,
+c.collection_id, c.owner_id, c.encrypted_key,c.key_decryption_nonce, c.name, c.encrypted_name, c.name_decryption_nonce, c.type, c.app, c.attributes, c.updation_time, c.is_deleted, c.magic_metadata, c.pub_magic_metadata, c.parent_id, c.parent_encrypted_key, c.parent_key_nonce,
 users.user_id, users.encrypted_email, users.email_decryption_nonce, cs.role_type,
 pct.access_token, pct.valid_till, pct.device_limit, pct.created_at, pct.updated_at, pct.pw_hash, pct.pw_nonce, pct.mem_limit, pct.ops_limit, pct.enable_download, pct.enable_collect, pct.enable_comment, pct.enable_join, pct.min_role 
     FROM collections c
@@ -183,8 +207,9 @@ pct.access_token, pct.valid_till, pct.device_limit, pct.created_at, pct.updated_
 		var shareUserID, pctValidTill, pctCreatedAt, pctUpdatedAt, pctMemLimit, pctOpsLimit sql.NullInt64
 		var encryptedEmail, nonce []byte
 		var shareeRoleType, pctToken, pctPwHash, pctPwNonce, pctMinRole sql.NullString
+		var parent collectionParentColumns
 
-		if err := rows.Scan(&c.ID, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.App, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata, &c.PublicMagicMetadata,
+		if err := rows.Scan(&c.ID, &c.Owner.ID, &c.EncryptedKey, &c.KeyDecryptionNonce, &name, &encryptedName, &nameDecryptionNonce, &c.Type, &c.App, &c.Attributes, &c.UpdationTime, &c.IsDeleted, &c.MagicMetadata, &c.PublicMagicMetadata, &parent.id, &parent.encryptedKey, &parent.keyNonce,
 			&shareUserID, &encryptedEmail, &nonce, &shareeRoleType,
 			&pctToken, &pctValidTill, &pctDeviceLimit, &pctCreatedAt, &pctUpdatedAt, &pctPwHash, &pctPwNonce, &pctMemLimit, &pctOpsLimit, &pctEnableDownload, &pctEnableCollect, &pctEnableComment, &pctEnableJoin, &pctMinRole); err != nil {
 			return nil, stacktrace.Propagate(err, "")
@@ -197,6 +222,7 @@ pct.access_token, pct.valid_till, pct.device_limit, pct.created_at, pct.updated_
 				c.EncryptedName = encryptedName.String
 				c.NameDecryptionNonce = nameDecryptionNonce.String
 			}
+			parent.applyTo(&c)
 			c.Sharees = make([]ente.CollectionUser, 0)
 			c.PublicURLs = make([]ente.PublicURL, 0)
 			collectionIDToValMap[c.ID] = &c
