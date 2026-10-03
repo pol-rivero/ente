@@ -70,8 +70,8 @@ func (o Options) IsMultipart(size int64) bool {
 }
 
 func (o Options) PartSize(size int64) int64 {
-	partSize := max(o.MinPartSize, ceilDiv(size, int64(max(o.MaxParts, 1))))
-	return ceilDiv(partSize, partAlignment) * partAlignment
+	partSize := max(o.MinPartSize, CeilDiv(size, int64(max(o.MaxParts, 1))))
+	return CeilDiv(partSize, partAlignment) * partAlignment
 }
 
 func Copy(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey string, size int64, opts Options) error {
@@ -164,7 +164,7 @@ func CopyMultipart(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey st
 
 // The parts come back ordered by part number, as CompleteMultipartUpload requires.
 func copyParts(ctx context.Context, client *s3.S3, bucket, source, dstKey, uploadID string, size, partSize int64, workers int) ([]*s3.CompletedPart, error) {
-	partCount := int(ceilDiv(size, partSize))
+	partCount := int(CeilDiv(size, partSize))
 	parts := make([]*s3.CompletedPart, partCount)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(max(workers, 1))
@@ -206,7 +206,7 @@ func copyPart(ctx context.Context, client *s3.S3, input *s3.UploadPartCopyInput)
 		if err == nil {
 			return eTag, nil
 		}
-		if attempt >= len(retryDelays) || ctx.Err() != nil || !isTransient(err) {
+		if attempt >= len(retryDelays) || ctx.Err() != nil || !IsTransient(err) {
 			return "", err
 		}
 		select {
@@ -242,7 +242,7 @@ func copyPartOnce(ctx context.Context, s3Client *s3.S3, input *s3.UploadPartCopy
 	return *out.CopyPartResult.ETag, nil
 }
 
-func isTransient(err error) bool {
+func IsTransient(err error) bool {
 	if errors.Is(err, errPartCopyTimedOut) {
 		return true
 	}
@@ -286,6 +286,6 @@ func withTimeout(ctx context.Context, timeout time.Duration) (context.Context, c
 	return context.WithTimeout(ctx, timeout)
 }
 
-func ceilDiv(a, b int64) int64 {
+func CeilDiv(a, b int64) int64 {
 	return (a + b - 1) / b
 }

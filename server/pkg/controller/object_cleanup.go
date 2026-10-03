@@ -279,11 +279,21 @@ func (c *ObjectCleanupController) disableConditionalHoldIfPresent(dc string, obj
 // then leaves the row without one.
 func (c *ObjectCleanupController) AbortMultipartUploadsForKey(ctx context.Context, objectKey string, dc string) error {
 	s3Client := c.S3Config.GetS3Client(dc)
+	return forEachMultipartUpload(ctx, &s3Client, c.S3Config.GetBucket(dc), &objectKey, func(upload *s3.MultipartUpload) error {
+		// The prefix also matches longer keys.
+		if aws.StringValue(upload.Key) != objectKey || aws.StringValue(upload.UploadId) == "" {
+			return nil
+		}
+		return stacktrace.Propagate(c.AbortMultipartUploadWithContext(ctx, objectKey, *upload.UploadId, dc), "")
+	})
+}
+
+func forEachMultipartUpload(ctx context.Context, s3Client *s3.S3, bucket *string, prefix *string, fn func(*s3.MultipartUpload) error) error {
 	var keyMarker, uploadIDMarker *string
 	for {
 		output, err := s3Client.ListMultipartUploadsWithContext(ctx, &s3.ListMultipartUploadsInput{
-			Bucket:         c.S3Config.GetBucket(dc),
-			Prefix:         &objectKey,
+			Bucket:         bucket,
+			Prefix:         prefix,
 			KeyMarker:      keyMarker,
 			UploadIdMarker: uploadIDMarker,
 		})
@@ -291,12 +301,8 @@ func (c *ObjectCleanupController) AbortMultipartUploadsForKey(ctx context.Contex
 			return stacktrace.Propagate(err, "")
 		}
 		for _, upload := range output.Uploads {
-			// The prefix also matches longer keys.
-			if aws.StringValue(upload.Key) != objectKey || aws.StringValue(upload.UploadId) == "" {
-				continue
-			}
-			if err := c.AbortMultipartUploadWithContext(ctx, objectKey, *upload.UploadId, dc); err != nil {
-				return stacktrace.Propagate(err, "")
+			if err := fn(upload); err != nil {
+				return err
 			}
 		}
 		if !aws.BoolValue(output.IsTruncated) {

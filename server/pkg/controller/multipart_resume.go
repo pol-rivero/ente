@@ -214,11 +214,15 @@ func (c *FileController) uploadDataCenter(upload repo.LockedTempObject) string {
 
 func (c *FileController) listUploadedParts(ctx context.Context, dc string, objectKey string, uploadID string) ([]ente.MultipartUploadPart, error) {
 	s3Client := c.S3Config.GetS3Client(dc)
+	return listMultipartUploadParts(ctx, &s3Client, c.S3Config.GetBucket(dc), objectKey, uploadID)
+}
+
+func listMultipartUploadParts(ctx context.Context, s3Client *s3.S3, bucket *string, objectKey string, uploadID string) ([]ente.MultipartUploadPart, error) {
 	parts := make([]ente.MultipartUploadPart, 0)
 	var marker *int64
 	for {
 		output, err := s3Client.ListPartsWithContext(ctx, &s3.ListPartsInput{
-			Bucket:           c.S3Config.GetBucket(dc),
+			Bucket:           bucket,
 			Key:              &objectKey,
 			UploadId:         &uploadID,
 			PartNumberMarker: marker,

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/stacktrace"
@@ -45,7 +46,7 @@ func (repo *ObjectCopiesRepository) GetAndLockUnreplicatedObject(ctx context.Con
 		return nil, stacktrace.Propagate(err, "")
 	}
 
-	err = repo.RegisterReplicationAttempt(tx, ctx, r.ObjectKey)
+	r.LastAttempt, err = repo.RegisterReplicationAttempt(tx, ctx, r.ObjectKey)
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "failed to register replication attempt")
 	}
@@ -73,13 +74,59 @@ func (repo *ObjectCopiesRepository) CreateNewWasabiObject(ctx context.Context, t
 	return stacktrace.Propagate(err, "")
 }
 
-func (repo *ObjectCopiesRepository) RegisterReplicationAttempt(tx *sql.Tx, ctx context.Context, objectKey string) error {
-	_, err := tx.ExecContext(ctx, `
+func (repo *ObjectCopiesRepository) RegisterReplicationAttempt(tx *sql.Tx, ctx context.Context, objectKey string) (int64, error) {
+	var lastAttempt int64
+	err := tx.QueryRowContext(ctx, `
 	UPDATE object_copies
 	SET last_attempt = now_utc_micro_seconds()
 	WHERE object_key = $1
-	`, objectKey)
+	RETURNING last_attempt
+	`, objectKey).Scan(&lastAttempt)
+	return lastAttempt, stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCopiesRepository) ExtendReplicationAttempt(ctx context.Context, objectKey string, lastAttempt int64) (int64, bool, error) {
+	var next int64
+	err := repo.DB.QueryRowContext(ctx, `
+	UPDATE object_copies
+	SET last_attempt = GREATEST(now_utc_micro_seconds(), last_attempt + 1)
+	WHERE object_key = $1 AND last_attempt = $2
+	RETURNING last_attempt
+	`, objectKey, lastAttempt).Scan(&next)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, stacktrace.Propagate(err, "")
+	}
+	return next, true, nil
+}
+
+// Makes the object pickable again after retryAfter instead of the usual 24 h,
+// unless another attempt has picked it since lastAttempt.
+func (repo *ObjectCopiesRepository) RetryReplicationAttemptAfter(ctx context.Context, objectKey string, lastAttempt int64, retryAfter time.Duration) error {
+	_, err := repo.DB.ExecContext(ctx, `
+	UPDATE object_copies
+	SET last_attempt = now_utc_micro_seconds() - (24::BIGINT * 60 * 60 * 1000 * 1000) + $3
+	WHERE object_key = $1 AND last_attempt = $2
+	`, objectKey, lastAttempt, retryAfter.Microseconds())
 	return stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCopiesRepository) Get(ctx context.Context, objectKey string) (*ente.ObjectCopies, error) {
+	var r ente.ObjectCopies
+	err := repo.DB.QueryRowContext(ctx, `
+	SELECT object_key, COALESCE(want_b2, false), b2, COALESCE(want_wasabi, false), wasabi,
+		COALESCE(want_scw, false), scw, last_attempt
+	FROM object_copies WHERE object_key = $1
+	`, objectKey).Scan(&r.ObjectKey, &r.WantB2, &r.B2, &r.WantWasabi, &r.Wasabi, &r.WantSCW, &r.SCW, &r.LastAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	return &r, nil
 }
 
 func (repo *ObjectCopiesRepository) DelayNextAttemptByDays(ctx context.Context, objectKey string, days int) error {

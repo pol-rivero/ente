@@ -43,7 +43,7 @@ func TestIsFileSizeAllowedWithoutInternalUserLookup(t *testing.T) {
 		{app: ente.Auth, size: MaxFileSize + 1, wantLimit: MaxFileSize},
 		{app: ente.Drive, size: DriveMaxFileSize, wantAllowed: true, wantLimit: DriveMaxFileSize},
 		{app: ente.Drive, size: DriveMaxFileSize + 1, wantLimit: DriveMaxFileSize},
-		{app: ente.Drive, size: InternalUserMaxFileSize, wantLimit: DriveMaxFileSize},
+		{app: ente.Drive, size: InternalUserMaxFileSize + 1, wantAllowed: true, wantLimit: DriveMaxFileSize},
 		{app: ente.Drive, public: true, size: DrivePublicMaxFileSize, wantAllowed: true, wantLimit: DrivePublicMaxFileSize},
 		{app: ente.Drive, public: true, size: DrivePublicMaxFileSize + 1, wantLimit: DrivePublicMaxFileSize},
 	} {
@@ -79,7 +79,7 @@ func TestIsFileSizeAllowedForInternalUsers(t *testing.T) {
 		{userID: internalID, app: ente.Photos, size: InternalUserMaxFileSize + 1},
 		{userID: internalID, app: ente.Photos, public: true, size: 15 * gib, wantAllowed: true},
 		{userID: internalID, app: ente.Locker, size: 15 * gib},
-		{userID: internalID, app: ente.Drive, size: 15 * gib},
+		{userID: internalID, app: ente.Drive, size: 15 * gib, wantAllowed: true},
 		{userID: internalID, app: ente.Drive, public: true, size: 15 * gib},
 		{userID: regularID, app: ente.Photos, size: 15 * gib},
 		{userID: disabledID, app: ente.Photos, size: 15 * gib},
@@ -115,8 +115,8 @@ func TestContentLengthTooLargeErrorResponses(t *testing.T) {
 	require.Contains(t, body, `"message":"contentLength exceeds max file size 10737418240"`)
 }
 
-// The too-many-parts error can't be reached under the current caps (10 GiB
-// at the 5 MiB minimum part length is 2 048 parts), so test it directly.
+// Photos and Locker can't reach the too-many-parts error (10 GiB at the 5 MiB
+// minimum part length is 2 048 parts), so test the responses directly.
 func TestTooManyPartsErrorResponses(t *testing.T) {
 	for _, app := range []ente.App{ente.Photos, ente.Locker} {
 		err := tooManyPartsError(app, 100*gib)

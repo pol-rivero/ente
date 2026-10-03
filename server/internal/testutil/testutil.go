@@ -129,6 +129,8 @@ func ResetTables(t *testing.T, db *sql.DB) {
 			tokens,
 			temp_objects,
 			file_copy_jobs,
+			object_copies,
+			replication_uploads,
 			user_attachments,
 			contact_entity,
 			entity_data,

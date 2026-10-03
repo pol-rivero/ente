@@ -393,6 +393,16 @@ replication:
     # Where to store temporary objects during replication v3
     # Optional, default value is indicated here.
     tmp-storage: tmp/replication
+    # Drive objects larger than this many bytes (and any object larger than
+    # 20 GiB) are replicated part by part, and resume after a restart.
+    # Optional, defaults to 1073741824 (1 GiB).
+    #streaming-threshold: 1073741824
+    # Disk space, in bytes, that the parts of streamed objects may use in
+    # tmp-storage at any time. Optional, defaults to 42949672960 (40 GiB).
+    #spool-budget: 42949672960
+    # Unfinished replication uploads older than this many days are aborted.
+    # Optional, default value is indicated here.
+    #orphan-upload-days: 14
 
 # Configuration for various background / cron jobs.
 jobs:

@@ -192,13 +192,14 @@ type S3ObjectKey struct {
 }
 
 type ObjectCopies struct {
-	ObjectKey  string
-	WantB2     bool
-	B2         *int64
-	WantWasabi bool
-	Wasabi     *int64
-	WantSCW    bool
-	SCW        *int64
+	ObjectKey   string
+	WantB2      bool
+	B2          *int64
+	WantWasabi  bool
+	Wasabi      *int64
+	WantSCW     bool
+	SCW         *int64
+	LastAttempt int64
 }
 
 type ObjectState struct {

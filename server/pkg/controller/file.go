@@ -65,8 +65,8 @@ const MaxFileSize = int64(1024 * 1024 * 1024 * 10)
 
 const InternalUserMaxFileSize = int64(1024 * 1024 * 1024 * 20)
 
-// Interim until replication streams large objects (task 1.6 raises it to 5 000 GiB).
-const DriveMaxFileSize = int64(10) << 30
+// 1 000 parts × 5 GiB, the most replication can upload to Wasabi and Scaleway.
+const DriveMaxFileSize = int64(5000) << 30
 
 const DrivePublicMaxFileSize = int64(10) << 30
 

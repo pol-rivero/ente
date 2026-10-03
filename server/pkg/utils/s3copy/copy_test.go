@@ -68,7 +68,7 @@ func TestPartSize(t *testing.T) {
 		partSize := DefaultOptions(tt.maxParts).PartSize(tt.size)
 		require.Equal(t, tt.want, partSize, "size %d, maxParts %d", tt.size, tt.maxParts)
 		require.Zero(t, partSize%mib)
-		require.LessOrEqual(t, ceilDiv(tt.size, partSize), int64(tt.maxParts))
+		require.LessOrEqual(t, CeilDiv(tt.size, partSize), int64(tt.maxParts))
 		require.LessOrEqual(t, partSize, MaxPartSize)
 	}
 	require.False(t, DefaultOptions(10000).IsMultipart(MaxSingleCopySize))

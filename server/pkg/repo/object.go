@@ -426,6 +426,23 @@ func (repo *ObjectRepository) GetObjectReferenceStatuses(ctx context.Context, ob
 	return statuses, stacktrace.Propagate(rows.Err(), "")
 }
 
+// app is empty for files without a stored app.
+func (repo *ObjectRepository) GetObjectSizeAndApp(ctx context.Context, objectKey string) (size int64, app string, found bool, err error) {
+	err = repo.DB.QueryRowContext(ctx, `
+	SELECT ok.size, COALESCE(f.app::text, '')
+	FROM object_keys ok
+	JOIN files f ON ok.file_id = f.file_id
+	WHERE ok.object_key = $1
+	`, objectKey).Scan(&size, &app)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, nil
+	}
+	if err != nil {
+		return 0, "", false, stacktrace.Propagate(err, "")
+	}
+	return size, app, true, nil
+}
+
 // Unknown object keys are treated as deleted.
 func (repo *ObjectRepository) GetObjectState(objectKey string) (ObjectState ente.ObjectState, err error) {
 	row := repo.DB.QueryRow(`

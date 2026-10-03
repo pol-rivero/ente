@@ -348,10 +348,12 @@ func main() {
 	}
 
 	replicationController3 := &controller.ReplicationController3{
-		S3Config:          s3Config,
-		ObjectRepo:        objectRepo,
-		ObjectCopiesRepo:  objectCopiesRepo,
-		DiscordController: discordController,
+		S3Config:               s3Config,
+		ObjectRepo:             objectRepo,
+		ObjectCopiesRepo:       objectCopiesRepo,
+		ReplicationUploadsRepo: &repo.ReplicationUploadsRepository{DB: db},
+		LockController:         lockController,
+		DiscordController:      discordController,
 	}
 
 	trashController := &controller.TrashController{
@@ -1137,6 +1139,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Shutting down server...")
+	replicationController3.StopReplication()
 	fileCopyCtrl.StopJobWorker(5 * time.Second)
 	discordController.NotifyShutdown()
 }

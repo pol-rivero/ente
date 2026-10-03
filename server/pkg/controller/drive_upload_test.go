@@ -144,7 +144,7 @@ func requireLegacyBadRequest(t *testing.T, err error, logMessage string) {
 }
 
 func TestMultipartUploadSizeLimits(t *testing.T) {
-	c, db, _ := setupUploadLimitsTest(t, 100*gib)
+	c, db, _ := setupUploadLimitsTest(t, DriveMaxFileSize+100*gib)
 	atLimit := ente.MultipartUploadURLRequest{ContentLength: DriveMaxFileSize, PartLength: gib}
 	overLimit := ente.MultipartUploadURLRequest{ContentLength: DriveMaxFileSize + 1, PartLength: gib}
 
@@ -174,8 +174,9 @@ func TestMultipartUploadSizeLimits(t *testing.T) {
 	_, err = c.GetMultipartUploadURLWithMetadata(t.Context(), uploadLimitsUserID,
 		ente.MultipartUploadURLRequest{ContentLength: InternalUserMaxFileSize + 1, PartLength: gib}, ente.Photos, "client", false)
 	requireLegacyBadRequest(t, err, "contentLength exceeds max file size 10737418240")
-	_, err = c.GetMultipartUploadURLWithMetadata(t.Context(), uploadLimitsUserID, internalRequest, ente.Drive, "client", false)
-	requireBadRequestMessage(t, err, fmt.Sprintf("contentLength exceeds max file size %d", DriveMaxFileSize))
+	_, err = c.GetMultipartUploadURLWithMetadata(t.Context(), uploadLimitsUserID,
+		ente.MultipartUploadURLRequest{ContentLength: InternalUserMaxFileSize + 1, PartLength: gib}, ente.Drive, "client", false)
+	require.NoError(t, err)
 }
 
 func TestMultipartUploadQuotaAtStart(t *testing.T) {
@@ -259,7 +260,7 @@ func TestCreateExpiresOnlyOversizedUploads(t *testing.T) {
 		{app: ente.Photos, size: MaxFileSize + 1, wantErr: ente.ErrFileTooLarge, wantExpired: true},
 		{app: ente.Photos, size: InternalUserMaxFileSize + 1, wantErr: ente.ErrFileTooLarge, wantExpired: true, internalUser: true},
 		{app: ente.Drive, size: DriveMaxFileSize + 1, wantErr: ente.ErrFileTooLarge, wantExpired: true},
-		{app: ente.Drive, size: 15 * gib, wantErr: ente.ErrFileTooLarge, wantExpired: true, internalUser: true},
+		{app: ente.Drive, size: InternalUserMaxFileSize + 1, wantErr: ente.ErrStorageLimitExceeded, internalUser: true},
 		{app: ente.Photos, size: 2 * gib, wantErr: ente.ErrStorageLimitExceeded},
 		{app: ente.Photos, size: 15 * gib, wantErr: ente.ErrStorageLimitExceeded, internalUser: true},
 		{app: ente.Drive, size: DriveMaxFileSize, wantErr: ente.ErrStorageLimitExceeded},
@@ -317,7 +318,7 @@ func TestUpdateSizeLimitFollowsStoredFileApp(t *testing.T) {
 		{stored: "", header: ente.Drive, size: 15 * gib, internalUser: true, wantErr: ente.ErrStorageLimitExceeded},
 		{stored: "drive", header: ente.Drive, size: DriveMaxFileSize, wantErr: ente.ErrStorageLimitExceeded},
 		{stored: "drive", header: ente.Drive, size: DriveMaxFileSize + 1, wantErr: ente.ErrFileTooLarge, wantExpired: true},
-		{stored: "drive", header: ente.Photos, size: 15 * gib, internalUser: true, wantErr: ente.ErrFileTooLarge, wantExpired: true},
+		{stored: "drive", header: ente.Photos, size: InternalUserMaxFileSize + 1, internalUser: true, wantErr: ente.ErrStorageLimitExceeded},
 		{stored: "photos", header: ente.Photos, size: MaxFileSize + 1, wantErr: ente.ErrFileTooLarge, wantExpired: true},
 		{stored: "locker", header: ente.Photos, size: 15 * gib, internalUser: true, wantErr: ente.ErrStorageLimitExceeded},
 		{stored: "photos", header: ente.Locker, size: 15 * gib, internalUser: true, wantErr: ente.ErrFileTooLarge, wantExpired: true},

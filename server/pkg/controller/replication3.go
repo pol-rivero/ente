@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/ente/museum/pkg/controller/discord"
+	"github.com/ente/museum/pkg/controller/lock"
 	"github.com/ente/museum/pkg/repo"
 	fileutil "github.com/ente/museum/pkg/utils/file"
 	"github.com/ente/museum/pkg/utils/s3config"
@@ -45,6 +47,11 @@ type ReplicationController3 struct {
 	b2Bucket          *string
 	wasabiDest        *UploadDestination
 	scwDest           *UploadDestination
+
+	ReplicationUploadsRepo *repo.ReplicationUploadsRepository
+	LockController         *lock.LockController
+	stream                 *streamingConfig
+	stopping               atomic.Bool
 }
 
 type UploadDestination struct {
@@ -82,10 +89,18 @@ func (c *ReplicationController3) StartReplication() error {
 	if workerCount == 0 {
 		workerCount = 6
 	}
+	c.stream = newStreamingConfig(workerCount)
+	log.Infof("Replication streams Drive objects above %d bytes", c.stream.threshold)
 
 	go c.startWorkers(workerCount)
+	c.startOrphanSweeper()
 
 	return nil
+}
+
+// In-flight attempts aren't waited for: they resume (streaming) or retry.
+func (c *ReplicationController3) StopReplication() {
+	c.stopping.Store(true)
 }
 
 func (c *ReplicationController3) startWorkers(n int) {
@@ -169,15 +184,15 @@ func (c *ReplicationController3) createDestinations() {
 }
 
 func (c *ReplicationController3) replicate(i int) {
-	for {
-		err := c.tryReplicate()
+	for !c.stopping.Load() {
+		err := c.tryReplicate(context.Background())
 		if err != nil {
 			time.Sleep(time.Duration(i+1) * time.Minute)
 		}
 	}
 }
 
-func (c *ReplicationController3) tryReplicate() error {
+func (c *ReplicationController3) tryReplicate(ctx context.Context) error {
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	copies, err := c.ObjectCopiesRepo.GetAndLockUnreplicatedObject(ctxWithTimeout)
@@ -232,6 +247,11 @@ func (c *ReplicationController3) tryReplicate() error {
 	}
 
 	if ob.IsFileDeleted || ob.IsUserDeleted {
+		if streams, err := c.streamsObject(ctx, objectKey, ob.Size); err != nil {
+			logger.WithError(err).Warn("Failed to check for stored replication uploads")
+		} else if streams {
+			c.dropStoredUploads(objectKey, logger)
+		}
 		// Scheduled object deletion removes the object_copies row later.
 		err = c.ObjectCopiesRepo.UnmarkFromReplication(objectKey)
 		if err != nil {
@@ -240,6 +260,21 @@ func (c *ReplicationController3) tryReplicate() error {
 		logger.Infof("Skipping replication for deleted object (isFileDeleted = %v, isUserDeleted = %v)",
 			ob.IsFileDeleted, ob.IsUserDeleted)
 		return done(nil)
+	}
+
+	// Without the app, the legacy path still replicates objects up to 20 GiB,
+	// as it always has.
+	streams, err := c.streamsObject(ctx, objectKey, ob.Size)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to check whether to stream the object, using the legacy path")
+	}
+	if streams {
+		if !c.stream.slots.TryAcquire(1) {
+			c.deferStreaming(copies, logger)
+			return nil
+		}
+		defer c.stream.slots.Release(1)
+		return done(c.replicateStreaming(ctx, copies, ob.Size, logger))
 	}
 
 	err = fileutil.EnsureSufficientSpace(ob.Size)
@@ -392,17 +427,34 @@ func (c *ReplicationController3) replicateFile(in *UploadInput, dest *UploadDest
 		}
 	}
 
-	err = c.verifyUploadedFileSize(in, dest)
+	err = c.verifyUploadedFileSize(context.Background(), in, dest)
 	if err != nil {
 		return failure(stacktrace.Propagate(err, "Failed to verify upload"))
 	}
 
+	err = c.recordReplica(in.ObjectKey, dest, logger, dbUpdateCopies)
+	if err != nil {
+		return failure(err)
+	}
+	return nil
+}
+
+func (c *ReplicationController3) destinationFailure(dest *UploadDestination, err error, logger *log.Entry) error {
+	c.mUploadFailure.WithLabelValues(dest.Label).Inc()
+	logger.WithFields(log.Fields{
+		"destination": dest.Label,
+		"bucket":      *dest.Bucket,
+	}).Error(err)
+	return err
+}
+
+func (c *ReplicationController3) recordReplica(objectKey string, dest *UploadDestination, logger *log.Entry, dbUpdateCopies func() error) error {
 	// Record each successful upload in object_keys before updating object_copies.
 	// The object_copies transaction can span all replica uploads; a restart in
 	// that window must not leave an uploaded replica absent from deletion records.
-	rowsAffected, err := c.ObjectRepo.MarkObjectReplicated(in.ObjectKey, dest.DC)
+	rowsAffected, err := c.ObjectRepo.MarkObjectReplicated(objectKey, dest.DC)
 	if err != nil {
-		return failure(stacktrace.Propagate(err, "Failed to update object_keys to mark replication as completed"))
+		return stacktrace.Propagate(err, "Failed to update object_keys to mark replication as completed")
 	}
 
 	if rowsAffected != 1 {
@@ -412,7 +464,7 @@ func (c *ReplicationController3) replicateFile(in *UploadInput, dest *UploadDest
 
 	err = dbUpdateCopies()
 	if err != nil {
-		return failure(stacktrace.Propagate(err, "Failed to update object_copies to mark replication as complete"))
+		return stacktrace.Propagate(err, "Failed to update object_copies to mark replication as complete")
 	}
 
 	c.mUploadSuccess.WithLabelValues(dest.Label).Inc()
@@ -457,8 +509,8 @@ func (c *ReplicationController3) isRequestFailureAccessDenied(err error) bool {
 	return false
 }
 
-func (c *ReplicationController3) verifyUploadedFileSize(in *UploadInput, dest *UploadDestination) error {
-	res, err := dest.Client.HeadObject(&s3.HeadObjectInput{
+func (c *ReplicationController3) verifyUploadedFileSize(ctx context.Context, in *UploadInput, dest *UploadDestination) error {
+	res, err := dest.Client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 		Bucket: dest.Bucket,
 		Key:    &in.ObjectKey,
 	})

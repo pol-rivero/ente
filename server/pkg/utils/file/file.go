@@ -62,6 +62,28 @@ func EnsureSufficientSpace(size int64) error {
 	return nil
 }
 
+// Unlike EnsureSufficientSpace, checks the given path and counts only the
+// blocks available to unprivileged users.
+func EnsureAvailableSpace(path string, need int64) error {
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(path, &fs); err != nil {
+		return stacktrace.Propagate(err, "Failed to fetch free space of %s", path)
+	}
+	available := fs.Bavail * uint64(fs.Bsize)
+	if need < 0 || available < uint64(need) {
+		return fmt.Errorf("insufficient space on %s (need %d bytes, available %d bytes)", path, need, available)
+	}
+	return nil
+}
+
+var unsafeFileNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
+func CreateUniqueTemporaryFile(tempStorage string, key string, suffix string) (*os.File, error) {
+	name := unsafeFileNameChars.ReplaceAllString(key, "_") + "-" + suffix + "-*"
+	f, err := os.CreateTemp(tempStorage, name)
+	return f, stacktrace.Propagate(err, "Could not create temporary file in '%s'", tempStorage)
+}
+
 var validFileName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func CreateTemporaryFile(tempStorage string, tempFileName string) (string, *os.File, error) {
