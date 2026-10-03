@@ -151,7 +151,7 @@ func (c *ObjectCleanupController) removeUnreportedObject(tx *sql.Tx, t ente.Temp
 			return skip(err)
 		}
 	case t.IsMultipart || t.PartLength != nil:
-		err = c.abortMultipartUploadsForKey(t.ObjectKey, dc)
+		err = c.AbortMultipartUploadsForKey(context.Background(), t.ObjectKey, dc)
 		if err != nil {
 			return skip(err)
 		}
@@ -277,11 +277,11 @@ func (c *ObjectCleanupController) disableConditionalHoldIfPresent(dc string, obj
 // Reserved Drive multipart starts store their upload ID only after
 // CreateMultipartUpload returns, so a crash, a failed start or a cancel before
 // then leaves the row without one.
-func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, dc string) error {
+func (c *ObjectCleanupController) AbortMultipartUploadsForKey(ctx context.Context, objectKey string, dc string) error {
 	s3Client := c.S3Config.GetS3Client(dc)
 	var keyMarker, uploadIDMarker *string
 	for {
-		output, err := s3Client.ListMultipartUploads(&s3.ListMultipartUploadsInput{
+		output, err := s3Client.ListMultipartUploadsWithContext(ctx, &s3.ListMultipartUploadsInput{
 			Bucket:         c.S3Config.GetBucket(dc),
 			Prefix:         &objectKey,
 			KeyMarker:      keyMarker,
@@ -295,7 +295,7 @@ func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, 
 			if aws.StringValue(upload.Key) != objectKey || aws.StringValue(upload.UploadId) == "" {
 				continue
 			}
-			if err := c.abortMultipartUpload(objectKey, *upload.UploadId, dc); err != nil {
+			if err := c.AbortMultipartUploadWithContext(ctx, objectKey, *upload.UploadId, dc); err != nil {
 				return stacktrace.Propagate(err, "")
 			}
 		}
@@ -321,10 +321,10 @@ func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, 
 }
 
 func (c *ObjectCleanupController) abortMultipartUpload(objectKey string, uploadID string, dc string) error {
-	return c.abortMultipartUploadWithContext(context.Background(), objectKey, uploadID, dc)
+	return c.AbortMultipartUploadWithContext(context.Background(), objectKey, uploadID, dc)
 }
 
-func (c *ObjectCleanupController) abortMultipartUploadWithContext(ctx context.Context, objectKey string, uploadID string, dc string) error {
+func (c *ObjectCleanupController) AbortMultipartUploadWithContext(ctx context.Context, objectKey string, uploadID string, dc string) error {
 	s3Client := c.S3Config.GetS3Client(dc)
 	bucket := c.S3Config.GetBucket(dc)
 	_, err := s3Client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{

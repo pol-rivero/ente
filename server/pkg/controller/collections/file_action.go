@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"context"
 	"slices"
 
 	"github.com/ente/museum/ente"
@@ -304,7 +305,7 @@ func (c *CollectionController) isRemoveAllowed(ctx *gin.Context,
 	return nil
 }
 
-func (c *CollectionController) IsCopyAllowed(ctx *gin.Context, actorUserID int64, req ente.CopyFileSyncRequest) (ente.App, error) {
+func (c *CollectionController) IsCopyAllowed(ctx context.Context, actorUserID int64, req ente.CopyFileSyncRequest) (ente.App, error) {
 	if err := validateCollectionFileItems(req.CollectionFileItems); err != nil {
 		return "", err
 	}

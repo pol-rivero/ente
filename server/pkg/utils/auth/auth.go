@@ -91,6 +91,11 @@ func GetApp(c *gin.Context) ente.App {
 	return ente.Photos
 }
 
+// Only Drive clients can opt into async copies; others always copy synchronously.
+func IsAsyncDriveCopy(c *gin.Context) bool {
+	return c.Query("async") == "true" && GetApp(c) == ente.Drive
+}
+
 func GetAuthenticatedApp(c *gin.Context) (ente.App, bool) {
 	app, ok := c.Get(AppContextKey)
 	if !ok {

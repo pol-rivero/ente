@@ -149,7 +149,7 @@ func (c *FileController) AbortMultipartUpload(ctx context.Context, userID int64,
 	// upload if this fails or the client disconnects.
 	ctx, cancel := context.WithTimeout(ctx, multipartUploadStorageTimeout)
 	defer cancel()
-	if err := c.ObjectCleanupCtrl.abortMultipartUploadWithContext(ctx, objectKey, upload.UploadID, c.uploadDataCenter(upload)); err != nil {
+	if err := c.ObjectCleanupCtrl.AbortMultipartUploadWithContext(ctx, objectKey, upload.UploadID, c.uploadDataCenter(upload)); err != nil {
 		log.WithError(err).WithField("object_key", objectKey).Warn("Failed to abort multipart upload, leaving it to the cleanup cron")
 	}
 	return nil

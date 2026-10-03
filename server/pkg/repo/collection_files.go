@@ -94,6 +94,22 @@ func (repo *CollectionRepository) DoAllFilesExistInGivenCollections(fileIDs []in
 	return nil
 }
 
+var ErrFileNotInCollection = errors.New("file not in collection")
+
+// Keeps the previous message, and the HTTP handler doesn't recognise it, so
+// existing responses stay a 500.
+type fileNotInCollectionError struct {
+	fileID, collectionID int64
+}
+
+func (e fileNotInCollectionError) Error() string {
+	return fmt.Sprintf("fileID %d not found in collection %d", e.fileID, e.collectionID)
+}
+
+func (e fileNotInCollectionError) Is(target error) bool {
+	return target == ErrFileNotInCollection
+}
+
 func (repo *CollectionRepository) VerifyAllFileIDsExistsInCollection(ctx context.Context, cID int64, fileIDs []int64) error {
 	if len(fileIDs) == 0 {
 		return nil
@@ -117,7 +133,7 @@ func (repo *CollectionRepository) VerifyAllFileIDsExistsInCollection(ctx context
 	}
 	for _, fileID := range fileIDs {
 		if _, ok := fileIdMap[fileID]; !ok {
-			return stacktrace.Propagate(fmt.Errorf("fileID %d not found in collection %d", fileID, cID), "")
+			return stacktrace.Propagate(fileNotInCollectionError{fileID: fileID, collectionID: cID}, "")
 		}
 	}
 	return nil

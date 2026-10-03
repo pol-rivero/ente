@@ -254,6 +254,24 @@ var ErrQuotaCheckBusy = &ApiError{
 	HttpStatusCode: http.StatusServiceUnavailable,
 }
 
+var ErrCopyReservationLost = &ApiError{
+	Code:           CopyReservationLost,
+	Message:        "The storage reserved for the copy is no longer held",
+	HttpStatusCode: http.StatusGone,
+}
+
+var ErrCopySourceChanged = &ApiError{
+	Code:           CopySourceChanged,
+	Message:        "A source file changed after the copy was requested",
+	HttpStatusCode: http.StatusConflict,
+}
+
+var ErrCopyAttemptsExceeded = &ApiError{
+	Code:           CopyAttemptsExceeded,
+	Message:        "The copy was interrupted too many times",
+	HttpStatusCode: http.StatusInternalServerError,
+}
+
 var ErrLockerRegistrationDisabled = &ApiError{
 	Code:           LockerRegistrationDisabled,
 	Message:        "Locker is restricted to paid users currently",
@@ -314,6 +332,14 @@ const (
 	UploadBusy ErrorCode = "UPLOAD_BUSY"
 
 	QuotaCheckBusy ErrorCode = "QUOTA_CHECK_BUSY"
+
+	PermissionDenied     ErrorCode = "PERMISSION_DENIED"
+	StorageLimitExceeded ErrorCode = "STORAGE_LIMIT_EXCEEDED"
+	NoActiveSubscription ErrorCode = "NO_ACTIVE_SUBSCRIPTION"
+	FileTooLarge         ErrorCode = "FILE_TOO_LARGE"
+	CopyReservationLost  ErrorCode = "COPY_RESERVATION_LOST"
+	CopyAttemptsExceeded ErrorCode = "COPY_ATTEMPTS_EXCEEDED"
+	CopySourceChanged    ErrorCode = "COPY_SOURCE_CHANGED"
 
 	SessionExpired ErrorCode = "SESSION_EXPIRED"
 
@@ -385,7 +411,7 @@ func NewBadRequestWithMessage(message string) *ApiError {
 
 func NewPermissionDeniedError(message string) *ApiError {
 	return &ApiError{
-		Code:           "PERMISSION_DENIED",
+		Code:           PermissionDenied,
 		HttpStatusCode: http.StatusForbidden,
 		Message:        message,
 	}

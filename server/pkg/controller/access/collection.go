@@ -1,9 +1,10 @@
 package access
 
 import (
+	"context"
+
 	"github.com/ente/museum/ente"
 	"github.com/ente/stacktrace"
-	"github.com/gin-gonic/gin"
 )
 
 type GetCollectionParams struct {
@@ -19,7 +20,7 @@ type GetCollectionResponse struct {
 	Role       *ente.CollectionParticipantRole
 }
 
-func (c controllerImpl) GetCollection(ctx *gin.Context, req *GetCollectionParams) (*GetCollectionResponse, error) {
+func (c controllerImpl) GetCollection(ctx context.Context, req *GetCollectionParams) (*GetCollectionResponse, error) {
 	collection, err := c.CollectionRepo.Get(req.CollectionID)
 	role := ente.UNKNOWN
 	if err != nil {

@@ -101,7 +101,30 @@ func (h *FileHandler) CopyFiles(c *gin.Context) {
 		handler.Error(c, stacktrace.Propagate(ente.NewBadRequestWithMessage(fmt.Sprintf("more than %d items", DefaultCopyBatchSize)), ""))
 		return
 	}
+	if auth.IsAsyncDriveCopy(c) {
+		job, err := h.FileCopyCtrl.EnqueueCopy(c, req)
+		if err != nil {
+			handler.Error(c, stacktrace.Propagate(err, ""))
+			return
+		}
+		c.JSON(http.StatusAccepted, job)
+		return
+	}
 	response, err := h.FileCopyCtrl.CopyFiles(c, req)
+	if err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *FileHandler) GetCopyJob(c *gin.Context) {
+	jobID, err := strconv.ParseInt(c.Param("jobID"), 10, 64)
+	if err != nil {
+		handler.Error(c, stacktrace.Propagate(ente.ErrNotFoundError.NewErr("copy job not found"), "invalid jobID"))
+		return
+	}
+	response, err := h.FileCopyCtrl.GetCopyJob(c.Request.Context(), auth.GetUserID(c.Request.Header), jobID)
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return

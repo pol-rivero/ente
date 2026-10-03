@@ -154,6 +154,8 @@ type CopyFileSyncRequest struct {
 	SrcCollectionID     int64                `json:"srcCollectionID" binding:"required"`
 	DstCollection       int64                `json:"dstCollectionID" binding:"required"`
 	CollectionFileItems []CollectionFileItem `json:"files" binding:"required"`
+	// Only read for async Drive copies.
+	RequestID string `json:"requestID,omitempty"`
 }
 
 type CopyResponse struct {

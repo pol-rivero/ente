@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -19,7 +20,7 @@ type allowCastCollectionAccess struct {
 	access.Controller
 }
 
-func (allowCastCollectionAccess) GetCollection(*gin.Context, *access.GetCollectionParams) (*access.GetCollectionResponse, error) {
+func (allowCastCollectionAccess) GetCollection(context.Context, *access.GetCollectionParams) (*access.GetCollectionResponse, error) {
 	return &access.GetCollectionResponse{}, nil
 }
 

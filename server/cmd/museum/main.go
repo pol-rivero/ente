@@ -598,6 +598,7 @@ func main() {
 		S3Config:       s3Config,
 		ObjectRepo:     objectRepo,
 		FileRepo:       fileRepo,
+		JobRepo:        &repo.FileCopyJobRepository{DB: db, ObjectCleanupRepo: objectCleanupRepo},
 	}
 
 	fileHandler := &api.FileHandler{
@@ -640,6 +641,7 @@ func main() {
 	storageAPI.POST("/files", fileHandler.CreateOrUpdate)
 	storageAPI.POST("/files/meta", fileHandler.CreateMetaFile)
 	storageAPI.POST("/files/copy", fileHandler.CopyFiles)
+	storageAPI.GET("/files/copy/:jobID", fileHandler.GetCopyJob)
 	storageAPI.PUT("/files/update", fileHandler.Update)
 	storageAPI.POST("/files/trash", fileHandler.Trash)
 	storageAPI.POST("/files/size", fileHandler.GetSize)
@@ -1104,7 +1106,7 @@ func main() {
 	adminAPI.POST("/discount/add-coupons", discountCouponHandler.AddCoupons)
 
 	setKnownAPIs(server.Routes())
-	setupAndStartBackgroundJobs(objectCleanupController, replicationController3, fileDataCtrl, contactController, spaceModule)
+	setupAndStartBackgroundJobs(objectCleanupController, replicationController3, fileDataCtrl, contactController, spaceModule, fileCopyCtrl)
 	time.AfterFunc(10*time.Minute, func() {
 		if err := remoteStoreRepository.MigrateCustomDomainCanonicalValues(context.Background()); err != nil {
 			log.WithError(err).Error("Failed to backfill custom domain canonical values")
@@ -1135,6 +1137,7 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("Shutting down server...")
+	fileCopyCtrl.StopJobWorker(5 * time.Second)
 	discordController.NotifyShutdown()
 }
 
@@ -1265,6 +1268,7 @@ func setupAndStartBackgroundJobs(
 	fileDataCtrl *filedata.Controller,
 	contactController *contactCtrl.Controller,
 	spaceModule *spacecontroller.Module,
+	fileCopyCtrl *file_copy.FileCopyController,
 ) {
 	isReplicationEnabled := viper.GetBool("replication.enabled")
 	if isReplicationEnabled {
@@ -1293,6 +1297,7 @@ func setupAndStartBackgroundJobs(
 	contactController.StartDataDeletion()
 	objectCleanupController.StartRemovingUnreportedObjects()
 	spaceModule.Cleanup.StartRemovingUnreportedObjects()
+	fileCopyCtrl.StartJobWorker()
 }
 
 func setupAndStartCrons(userAuthRepo *repo.UserAuthRepository, collectionLinkRepo *public.CollectionLinkRepo,

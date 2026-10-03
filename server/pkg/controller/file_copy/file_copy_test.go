@@ -117,6 +117,7 @@ func setupCopyTest(t *testing.T, app ente.App, storage int64) *copyFixture {
 			FileController: fileCtrl,
 			FileRepo:       fileRepo,
 			ObjectRepo:     objectRepo,
+			JobRepo:        &repo.FileCopyJobRepository{DB: db, ObjectCleanupRepo: cleanupRepo},
 			CollectionCtrl: &collections.CollectionController{
 				AccessCtrl:     access.NewAccessController(collectionRepo, fileRepo),
 				CollectionRepo: collectionRepo,
@@ -165,10 +166,18 @@ func (f *copyFixture) sourceKeys(fileID int64) (string, string) {
 }
 
 func (f *copyFixture) copyWithContext(ctx context.Context, header ente.App, fileIDs ...int64) (*ente.CopyResponse, error) {
+	return f.ctrl.CopyFiles(f.ginContext(ctx, header), f.copyRequest(fileIDs...))
+}
+
+func (f *copyFixture) ginContext(ctx context.Context, header ente.App) *gin.Context {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/files/copy", nil).WithContext(ctx)
 	c.Request.Header.Set("X-Auth-User-ID", strconv.FormatInt(actorID, 10))
 	c.Request.Header.Set("X-Client-Package", "io.ente."+string(header))
+	return c
+}
+
+func (f *copyFixture) copyRequest(fileIDs ...int64) ente.CopyFileSyncRequest {
 	items := make([]ente.CollectionFileItem, 0, len(fileIDs))
 	for _, id := range fileIDs {
 		items = append(items, ente.CollectionFileItem{
@@ -177,7 +186,7 @@ func (f *copyFixture) copyWithContext(ctx context.Context, header ente.App, file
 			KeyDecryptionNonce: base64.StdEncoding.EncodeToString(make([]byte, 24)),
 		})
 	}
-	return f.ctrl.CopyFiles(c, ente.CopyFileSyncRequest{SrcCollectionID: f.srcID, DstCollection: f.dstID, CollectionFileItems: items})
+	return ente.CopyFileSyncRequest{SrcCollectionID: f.srcID, DstCollection: f.dstID, CollectionFileItems: items}
 }
 
 func (f *copyFixture) copy(header ente.App, fileIDs ...int64) (*ente.CopyResponse, error) {
@@ -861,4 +870,27 @@ func TestCopyBetweenPhotosAndLockerCollectionsKeepsInvalidApp(t *testing.T) {
 
 	require.True(t, errors.Is(err, ente.ErrInvalidApp), "%v", err)
 	require.Empty(t, f.fake.Requests())
+}
+
+func TestCopyOfFilesNoLongerInTheSourceKeepsItsResponse(t *testing.T) {
+	for _, tt := range []struct {
+		name, change string
+		body         string
+	}{
+		{"removed from the collection", `UPDATE collection_files SET is_deleted = TRUE WHERE file_id = $1`, "{}"},
+		{"deleted", `DELETE FROM object_keys WHERE file_id = $1 AND o_type = 'thumbnail'`, `{"code":"INTERNAL_ERROR","message":"expected 2 objects, got 1"}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := setupCopyTest(t, ente.Photos, 100*gib)
+			fileID := f.addSourceFile(ente.Photos, mib, 1000)
+			_, err := f.db.Exec(tt.change, fileID)
+			require.NoError(t, err)
+
+			_, err = f.copy(ente.Photos, fileID)
+
+			status, body := response(err)
+			require.Equal(t, http.StatusInternalServerError, status)
+			require.JSONEq(t, tt.body, body)
+		})
+	}
 }

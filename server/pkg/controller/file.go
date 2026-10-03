@@ -168,12 +168,28 @@ type sizeResult struct {
 	err  error
 }
 
+type RequestInfo struct {
+	UserAgent string
+	Client    string
+	RequestID string
+}
+
 func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, userAgent string, app ente.App, publicUpload bool) (ente.File, error) {
+	info := RequestInfo{UserAgent: userAgent, Client: network.GetClientInfo(ctx), RequestID: requestid.Get(ctx)}
+	return c.create(ctx, ctx.Request.Context(), userID, file, info, app, publicUpload)
+}
+
+func (c *FileController) CreateWithContext(ctx context.Context, userID int64, file ente.File, info RequestInfo, app ente.App) (ente.File, error) {
+	return c.create(ctx, ctx, userID, file, info, app, false)
+}
+
+// HTTP callers pass their gin context as ctx: it is never cancelled, so only
+// the object HEADs (requestCtx) stop when the client disconnects.
+func (c *FileController) create(ctx context.Context, requestCtx context.Context, userID int64, file ente.File, info RequestInfo, app ente.App, publicUpload bool) (ente.File, error) {
 	err := c.validateFileCreateOrUpdateReq(userID, file, app)
 	if err != nil {
 		return file, stacktrace.Propagate(err, "")
 	}
-	requestCtx := ctx.Request.Context()
 	fileChan := make(chan sizeResult, 1)
 	thumbChan := make(chan sizeResult, 1)
 	go func() {
@@ -252,7 +268,7 @@ func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, 
 			if err != nil {
 				return file, stacktrace.Propagate(err, "")
 			}
-			file, err = c.onDuplicateObjectDetected(ctx, file, existing, hotDC)
+			file, err = c.onDuplicateObjectDetected(file, existing, hotDC, info)
 			if err != nil {
 				return file, stacktrace.Propagate(err, "")
 			}
@@ -261,7 +277,7 @@ func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, 
 		return file, stacktrace.Propagate(err, "")
 	}
 	if usage == fileSize+thumbnailSize && app == ente.Photos {
-		go c.maybeSendFirstUploadEmail(file.OwnerID, userAgent)
+		go c.maybeSendFirstUploadEmail(file.OwnerID, info.UserAgent)
 	}
 	return file, nil
 }
@@ -513,6 +529,11 @@ func (c *FileController) reserveDriveUpload(ctx context.Context, userID int64, o
 }
 
 func (c *FileController) ReserveDriveUploads(ctx context.Context, userID int64, objects []ente.TempObject) error {
+	return c.ReserveDriveUploadsWith(ctx, userID, objects, nil)
+}
+
+// inTx runs in the reservation's transaction; its error cancels the reservation.
+func (c *FileController) ReserveDriveUploadsWith(ctx context.Context, userID int64, objects []ente.TempObject, inTx func(ctx context.Context, tx *sql.Tx) error) error {
 	var size int64
 	for _, object := range objects {
 		size += *object.ContentLength
@@ -522,6 +543,9 @@ func (c *FileController) ReserveDriveUploads(ctx context.Context, userID int64, 
 			if err := c.ObjectCleanupCtrl.AddTempObjectTx(ctx, tx, object); err != nil {
 				return err
 			}
+		}
+		if inTx != nil {
+			return inTx(ctx, tx)
 		}
 		return nil
 	})
@@ -1104,7 +1128,7 @@ func (c *FileController) sizeOf(ctx context.Context, objectKey string) (int64, e
 	return -1, stacktrace.Propagate(err, "")
 }
 
-func (c *FileController) onDuplicateObjectDetected(ctx *gin.Context, file ente.File, existing ente.File, hotDC string) (ente.File, error) {
+func (c *FileController) onDuplicateObjectDetected(file ente.File, existing ente.File, hotDC string, info RequestInfo) (ente.File, error) {
 	newJSON, _ := json.Marshal(file)
 	existingJSON, _ := json.Marshal(existing)
 	log.Info("Comparing " + string(newJSON) + " against " + string(existingJSON))
@@ -1120,7 +1144,7 @@ func (c *FileController) onDuplicateObjectDetected(ctx *gin.Context, file ente.F
 		file.ID = existing.ID
 		return file, nil
 	} else {
-		go c.onExistingObjectsReplaced(ctx, file, hotDC)
+		go c.onExistingObjectsReplaced(file, hotDC, info)
 		return ente.File{}, ente.ErrBadRequest
 	}
 }
@@ -1134,14 +1158,14 @@ func (c *FileController) safeAlert(msg string) {
 	c.DiscordController.Notify(msg)
 }
 
-func (c *FileController) onExistingObjectsReplaced(ctx *gin.Context, file ente.File, hotDC string) {
+func (c *FileController) onExistingObjectsReplaced(file ente.File, hotDC string, info RequestInfo) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorf("Panic caught: %s, stack: %s", r, string(debug.Stack()))
 		}
 	}()
-	client := network.GetClientInfo(ctx)
-	reqId := requestid.Get(ctx)
+	client := info.Client
+	reqId := info.RequestID
 	revertErr := false
 	go c.safeAlert(fmt.Sprintf(`Client %s replaced an existing object req_id %s for (file: %s, thum %s)`, client, reqId, file.File.ObjectKey, file.Thumbnail.ObjectKey))
 	log.Error("Replaced existing object, reverting", file)
@@ -1423,7 +1447,7 @@ func (c *FileController) startReservedMultipartUpload(ctx context.Context, userI
 		c.releaseFailedUploadStart(ctx, userID, object.ObjectKey)
 		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartUploadStorageTimeout)
 		defer cancel()
-		if abortErr := c.ObjectCleanupCtrl.abortMultipartUploadWithContext(abortCtx, object.ObjectKey, uploadID, object.BucketId); abortErr != nil {
+		if abortErr := c.ObjectCleanupCtrl.AbortMultipartUploadWithContext(abortCtx, object.ObjectKey, uploadID, object.BucketId); abortErr != nil {
 			log.WithError(abortErr).WithField("object_key", object.ObjectKey).Warn("Failed to abort multipart upload, leaving it to the cleanup cron")
 		}
 		return "", stacktrace.Propagate(err, "")

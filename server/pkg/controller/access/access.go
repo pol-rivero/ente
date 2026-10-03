@@ -1,12 +1,14 @@
 package access
 
 import (
+	"context"
+
 	"github.com/ente/museum/pkg/repo"
 	"github.com/gin-gonic/gin"
 )
 
 type Controller interface {
-	GetCollection(ctx *gin.Context, req *GetCollectionParams) (*GetCollectionResponse, error)
+	GetCollection(ctx context.Context, req *GetCollectionParams) (*GetCollectionResponse, error)
 	VerifyFileOwnership(ctx *gin.Context, req *VerifyFileOwnershipParams) error
 	CanAccessFile(ctx *gin.Context, req *CanAccessFileParams) error
 }

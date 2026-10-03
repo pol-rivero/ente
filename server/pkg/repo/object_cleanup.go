@@ -128,11 +128,67 @@ func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, ob
 }
 
 func (repo *ObjectCleanupRepository) ReleaseTempObjects(ctx context.Context, objectKeys []string, userID int64, expirationTime int64) error {
-	_, err := repo.DB.ExecContext(ctx, `
+	return releaseTempObjects(ctx, repo.DB, objectKeys, userID, expirationTime)
+}
+
+func (repo *ObjectCleanupRepository) ReleaseTempObjectsTx(ctx context.Context, tx *sql.Tx, objectKeys []string, userID int64, expirationTime int64) error {
+	return releaseTempObjects(ctx, tx, objectKeys, userID, expirationTime)
+}
+
+func releaseTempObjects(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, objectKeys []string, userID int64, expirationTime int64) error {
+	_, err := db.ExecContext(ctx, `
 		UPDATE temp_objects SET expiration_time = $1, reservation_released = TRUE
 		WHERE object_key = ANY($2) AND user_id = $3 AND expiration_time > $4`,
 		expirationTime, pq.Array(objectKeys), userID, time.Microseconds())
 	return stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCleanupRepository) GetLiveTempObjects(ctx context.Context, userID int64, objectKeys []string, now int64) (map[string]ente.TempObject, error) {
+	rows, err := repo.DB.QueryContext(ctx, `
+		SELECT object_key, is_multipart, upload_id, bucket_id, part_length FROM temp_objects
+		WHERE object_key = ANY($1) AND user_id = $2 AND expiration_time > $3 AND NOT reservation_released`,
+		pq.Array(objectKeys), userID, now)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	defer rows.Close()
+	objects := make(map[string]ente.TempObject)
+	for rows.Next() {
+		object := ente.TempObject{UserID: userID}
+		var uploadID, bucketID sql.NullString
+		var partLength sql.NullInt64
+		if err := rows.Scan(&object.ObjectKey, &object.IsMultipart, &uploadID, &bucketID, &partLength); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		object.UploadID = uploadID.String
+		object.BucketId = bucketID.String
+		if partLength.Valid {
+			object.PartLength = &partLength.Int64
+		}
+		objects[object.ObjectKey] = object
+	}
+	return objects, stacktrace.Propagate(rows.Err(), "")
+}
+
+// Turns a row whose upload was aborted back into a pending one, so the copy can start again.
+func (repo *ObjectCleanupRepository) ResetTempObjectUpload(ctx context.Context, objectKey string, uploadID string, now int64) error {
+	res, err := repo.DB.ExecContext(ctx, `
+		UPDATE temp_objects SET upload_id = NULL, is_multipart = FALSE
+		WHERE object_key = $1 AND upload_id = $2 AND expiration_time > $3 AND NOT reservation_released`,
+		objectKey, uploadID, now)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if rowsAffected != 1 {
+		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to reset its upload", objectKey)
+	}
+	return nil
 }
 
 func (repo *ObjectCleanupRepository) ExpireLockedTempObject(ctx context.Context, tx *sql.Tx, objectKey string, userID int64, now int64) error {

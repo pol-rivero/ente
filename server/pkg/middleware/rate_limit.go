@@ -130,6 +130,9 @@ func (r *RateLimitMiddleware) APIRateLimitForUserMiddleware(urlSanitizer func(_ 
 		}
 
 		rateLimiter := r.getLimiter(requestPath, c.Request.Method)
+		if rateLimiter == nil && isAsyncDriveCopy(c, requestPath) {
+			rateLimiter = r.limit60ReqPerMin
+		}
 		if rateLimiter != nil {
 			userID := auth.GetUserID(c.Request.Header)
 			if userID == 0 {
@@ -223,6 +226,11 @@ func isAuthenticatedUploadURLPath(reqPath string) bool {
 		reqPath == "/files/multipart-upload"
 }
 
+// Synchronous copies stay unlimited, as before.
+func isAsyncDriveCopy(c *gin.Context, reqPath string) bool {
+	return reqPath == "/files/copy" && c.Request.Method == http.MethodPost && auth.IsAsyncDriveCopy(c)
+}
+
 func isEventURLPath(reqPath string) bool {
 	return reqPath == "/events" ||
 		reqPath == "/events/user"
@@ -282,6 +290,9 @@ func (r *RateLimitMiddleware) getLimiter(reqPath string, reqMethod string) *limi
 	}
 	if isAuthenticatedUploadURLPath(reqPath) {
 		return r.limit500ReqPerMin
+	}
+	if reqPath == "/files/copy/:jobID" && reqMethod == http.MethodGet {
+		return r.limit200ReqPerMin
 	}
 	if isPublicCollectionUploadURLPath(reqPath) {
 		return r.limit250ReqPerMin

@@ -29,6 +29,8 @@ const (
 	OpPartCopy Op = "UploadPartCopy"
 	OpComplete Op = "CompleteMultipartUpload"
 	OpAbort    Op = "AbortMultipartUpload"
+	OpList     Op = "ListMultipartUploads"
+	OpListPart Op = "ListParts"
 )
 
 const MinPartSize = int64(5) << 20
@@ -174,6 +176,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodDelete && req.UploadID != "":
 		req.Op = OpAbort
+	case r.Method == http.MethodGet && query.Has("uploads"):
+		req.Op = OpList
+		req.Key = query.Get("prefix")
+	case r.Method == http.MethodGet && req.UploadID != "":
+		req.Op = OpListPart
 	default:
 		s.fail(w, "unexpected request %s %s", r.Method, r.URL)
 		return
@@ -286,7 +293,42 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.uploads, req.UploadID)
 		w.WriteHeader(http.StatusNoContent)
+	case OpList:
+		ids := slices.Sorted(maps.Keys(s.uploads))
+		var body strings.Builder
+		fmt.Fprintf(&body, `<ListMultipartUploadsResult><Bucket>%s</Bucket><IsTruncated>false</IsTruncated>`, Bucket)
+		for _, id := range ids {
+			if strings.HasPrefix(s.uploads[id].Key, req.Key) {
+				fmt.Fprintf(&body, `<Upload><Key>%s</Key><UploadId>%s</UploadId></Upload>`, s.uploads[id].Key, id)
+			}
+		}
+		body.WriteString(`</ListMultipartUploadsResult>`)
+		_, _ = w.Write([]byte(body.String()))
+	case OpListPart:
+		upload, ok := s.upload(w, req)
+		if !ok {
+			return
+		}
+		var body strings.Builder
+		fmt.Fprintf(&body, `<ListPartsResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId><IsTruncated>false</IsTruncated>`,
+			Bucket, upload.Key, req.UploadID)
+		for _, number := range slices.Sorted(maps.Keys(upload.Parts)) {
+			part := upload.Parts[number]
+			fmt.Fprintf(&body, `<Part><PartNumber>%d</PartNumber><ETag>%s</ETag><Size>%d</Size></Part>`, number, part.ETag, part.End-part.Start+1)
+		}
+		body.WriteString(`</ListPartsResult>`)
+		_, _ = w.Write([]byte(body.String()))
 	}
+}
+
+// Starts an upload as a process that died before recording it would have.
+func (s *Server) StartUpload(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextID++
+	id := fmt.Sprintf("upload-%d", s.nextID)
+	s.uploads[id] = &Upload{Key: key, Parts: map[int64]Part{}}
+	return id
 }
 
 type completeMultipartUpload struct {

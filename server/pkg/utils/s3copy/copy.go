@@ -50,6 +50,10 @@ type Options struct {
 	// Called after CreateMultipartUpload and before any part is copied; an
 	// error aborts the upload.
 	OnUploadCreated func(uploadID string) error
+	// Zero means no timeout beyond ctx.
+	SingleCopyTimeout time.Duration
+	MetadataTimeout   time.Duration
+	CompleteTimeout   time.Duration
 }
 
 func DefaultOptions(maxParts int) Options {
@@ -75,6 +79,8 @@ func Copy(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey string, siz
 		return CopyMultipart(ctx, client, bucket, srcKey, dstKey, size, opts)
 	}
 	source := copySource(bucket, srcKey)
+	ctx, cancel := withTimeout(ctx, opts.SingleCopyTimeout)
+	defer cancel()
 	_, err := client.CopyObjectWithContext(ctx, &s3.CopyObjectInput{
 		Bucket:     &bucket,
 		CopySource: &source,
@@ -112,14 +118,18 @@ func CopyMultipart(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey st
 	if partSize > MaxPartSize {
 		return stacktrace.NewError("object of %d bytes needs %d-byte parts, above the %d-byte limit", size, partSize, MaxPartSize)
 	}
-	head, err := client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &srcKey})
+	headCtx, cancelHead := withTimeout(ctx, opts.MetadataTimeout)
+	head, err := client.HeadObjectWithContext(headCtx, &s3.HeadObjectInput{Bucket: &bucket, Key: &srcKey})
+	cancelHead()
 	if err != nil {
 		return stacktrace.Propagate(err, "failed to head copy source")
 	}
 	if aws.Int64Value(head.ContentLength) != size {
 		return stacktrace.Propagate(ErrSourceSizeMismatch, "copy source %s has %d bytes, expected %d", srcKey, aws.Int64Value(head.ContentLength), size)
 	}
-	created, err := client.CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{Bucket: &bucket, Key: &dstKey})
+	createCtx, cancelCreate := withTimeout(ctx, opts.MetadataTimeout)
+	created, err := client.CreateMultipartUploadWithContext(createCtx, &s3.CreateMultipartUploadInput{Bucket: &bucket, Key: &dstKey})
+	cancelCreate()
 	if err != nil {
 		return stacktrace.Propagate(err, "failed to create multipart upload")
 	}
@@ -141,7 +151,9 @@ func CopyMultipart(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey st
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = client.CompleteMultipartUploadWithContext(ctx, &s3.CompleteMultipartUploadInput{
+	completeCtx, cancelComplete := withTimeout(ctx, opts.CompleteTimeout)
+	defer cancelComplete()
+	_, err = client.CompleteMultipartUploadWithContext(completeCtx, &s3.CompleteMultipartUploadInput{
 		Bucket:          &bucket,
 		Key:             &dstKey,
 		UploadId:        &uploadID,
@@ -265,6 +277,13 @@ func abortUpload(client *s3.S3, bucket, key, uploadID string) {
 	if err != nil {
 		log.WithError(err).WithField("object_key", key).Warn("Failed to abort multipart copy")
 	}
+}
+
+func withTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func ceilDiv(a, b int64) int64 {
