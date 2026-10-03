@@ -151,6 +151,23 @@ type MultipartUploadURLs struct {
 	CompleteURL string   `json:"completeURL"`
 }
 
+type MultipartUploadResumeRequest struct {
+	ObjectKey string `json:"objectKey"`
+}
+
+type MultipartUploadPart struct {
+	PartNumber int64  `json:"partNumber"`
+	ETag       string `json:"eTag"`
+	Size       int64  `json:"size"`
+}
+
+type MultipartUploadResume struct {
+	Completed      bool                  `json:"-"`
+	CompletedParts []MultipartUploadPart `json:"completedParts"`
+	PartURLs       map[int64]string      `json:"partURLs"`
+	CompleteURL    string                `json:"completeURL"`
+}
+
 type MultipartUploadURLRequest struct {
 	ContentLength int64    `json:"contentLength" binding:"required"`
 	PartLength    int64    `json:"partLength" binding:"required"`
@@ -200,6 +217,7 @@ type TempObject struct {
 	Purpose       string
 	ContentLength *int64
 	ContentMD5    *string
+	PartLength    *int64
 	Client        string
 }
 

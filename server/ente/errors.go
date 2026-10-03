@@ -236,6 +236,18 @@ var ErrCrossAppFile = ApiError{
 	HttpStatusCode: http.StatusBadRequest,
 }
 
+var ErrUploadGone = &ApiError{
+	Code:           UploadGone,
+	Message:        "The upload no longer exists",
+	HttpStatusCode: http.StatusGone,
+}
+
+var ErrUploadBusy = &ApiError{
+	Code:           UploadBusy,
+	Message:        "The upload is being modified, retry shortly",
+	HttpStatusCode: http.StatusConflict,
+}
+
 var ErrLockerRegistrationDisabled = &ApiError{
 	Code:           LockerRegistrationDisabled,
 	Message:        "Locker is restricted to paid users currently",
@@ -290,6 +302,10 @@ const (
 	FileInTrash ErrorCode = "FILE_IN_TRASH"
 
 	CrossAppFile ErrorCode = "CROSS_APP_FILE"
+
+	UploadGone ErrorCode = "UPLOAD_GONE"
+
+	UploadBusy ErrorCode = "UPLOAD_BUSY"
 
 	SessionExpired ErrorCode = "SESSION_EXPIRED"
 

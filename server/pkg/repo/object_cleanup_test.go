@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/ente/museum/ente"
@@ -35,6 +36,57 @@ func TestExpireTempObjectNow(t *testing.T) {
 	require.Equal(t, future, expiry("1/legacy"))
 	require.Equal(t, future, expiry("2/other"))
 	require.Equal(t, int64(5), expiry("1/expired"))
+
+	rows, err := db.Query(`SELECT object_key FROM temp_objects WHERE reservation_released`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var released []string
+	for rows.Next() {
+		var key string
+		require.NoError(t, rows.Scan(&key))
+		released = append(released, key)
+	}
+	require.Equal(t, []string{"1/own"}, released)
+}
+
+func TestTempObjectsResumeMigration(t *testing.T) {
+	_, db, userID := setupCollectionMembershipTest(t)
+	for _, tt := range []struct {
+		column, dataType, nullable string
+		defaultValue               sql.NullString
+	}{
+		{column: "part_length", dataType: "bigint", nullable: "YES"},
+		{column: "resume_parts_completed", dataType: "integer", nullable: "YES"},
+		{column: "reservation_released", dataType: "boolean", nullable: "NO", defaultValue: sql.NullString{String: "false", Valid: true}},
+	} {
+		var dataType, nullable string
+		var defaultValue sql.NullString
+		require.NoError(t, db.QueryRow(`SELECT data_type, is_nullable, column_default FROM information_schema.columns
+			WHERE table_name = 'temp_objects' AND column_name = $1`, tt.column).Scan(&dataType, &nullable, &defaultValue))
+		require.Equal(t, tt.dataType, dataType, tt.column)
+		require.Equal(t, tt.nullable, nullable, tt.column)
+		require.Equal(t, tt.defaultValue, defaultValue, tt.column)
+	}
+
+	// The column list written by binaries that predate migration 151.
+	_, err := db.Exec(`
+		INSERT INTO temp_objects (
+		    object_key, expiration_time, upload_id, is_multipart, bucket_id,
+		    user_id, app, purpose, content_length, content_md5, client
+		) VALUES ('1/old-binary', 1, 'upload', TRUE, 'b2-eu-cen', $1, 'drive', 'file_upload', 10, NULL, 'client')`, userID)
+	require.NoError(t, err)
+	var partLength, partsCompleted sql.NullInt64
+	var released bool
+	require.NoError(t, db.QueryRow(`SELECT part_length, resume_parts_completed, reservation_released
+		FROM temp_objects WHERE object_key = '1/old-binary'`).Scan(&partLength, &partsCompleted, &released))
+	require.False(t, partLength.Valid)
+	require.False(t, partsCompleted.Valid)
+	require.False(t, released)
+
+	repo := &ObjectCleanupRepository{DB: db}
+	require.NoError(t, repo.AddTempObject(ente.TempObject{ObjectKey: "1/single", BucketId: "b2-eu-cen", UserID: userID}, 1))
+	require.NoError(t, db.QueryRow(`SELECT part_length FROM temp_objects WHERE object_key = '1/single'`).Scan(&partLength))
+	require.False(t, partLength.Valid)
 }
 
 func TestGetOwnerIDAndApp(t *testing.T) {

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"strings"
@@ -260,9 +261,13 @@ func (c *ObjectCleanupController) disableConditionalHoldIfPresent(dc string, obj
 }
 
 func (c *ObjectCleanupController) abortMultipartUpload(objectKey string, uploadID string, dc string) error {
+	return c.abortMultipartUploadWithContext(context.Background(), objectKey, uploadID, dc)
+}
+
+func (c *ObjectCleanupController) abortMultipartUploadWithContext(ctx context.Context, objectKey string, uploadID string, dc string) error {
 	s3Client := c.S3Config.GetS3Client(dc)
 	bucket := c.S3Config.GetBucket(dc)
-	_, err := s3Client.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+	_, err := s3Client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   bucket,
 		Key:      &objectKey,
 		UploadId: &uploadID,
@@ -274,7 +279,7 @@ func (c *ObjectCleanupController) abortMultipartUpload(objectKey string, uploadI
 		}
 		return stacktrace.Propagate(err, "")
 	}
-	r, err := s3Client.ListParts(&s3.ListPartsInput{
+	r, err := s3Client.ListPartsWithContext(ctx, &s3.ListPartsInput{
 		Bucket:   bucket,
 		Key:      &objectKey,
 		UploadId: &uploadID,

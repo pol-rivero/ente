@@ -203,6 +203,42 @@ func (h *FileHandler) GetMultipartUploadURLV2(c *gin.Context) {
 	c.JSON(http.StatusOK, upload)
 }
 
+func (h *FileHandler) ResumeMultipartUpload(c *gin.Context) {
+	userID := auth.GetUserID(c.Request.Header)
+	var req ente.MultipartUploadResumeRequest
+	if err := handler.BindJSON(c, &req); err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	if req.ObjectKey == "" {
+		handler.Error(c, stacktrace.Propagate(ente.NewBadRequestWithMessage("objectKey is required"), ""))
+		return
+	}
+	resume, err := h.Controller.ResumeMultipartUpload(c.Request.Context(), userID, req.ObjectKey)
+	if err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	if resume.Completed {
+		c.JSON(http.StatusOK, gin.H{"completed": true})
+		return
+	}
+	c.JSON(http.StatusOK, resume)
+}
+
+func (h *FileHandler) AbortMultipartUpload(c *gin.Context) {
+	objectKey := c.Query("objectKey")
+	if objectKey == "" {
+		handler.Error(c, stacktrace.Propagate(ente.NewBadRequestWithMessage("objectKey is required"), ""))
+		return
+	}
+	if err := h.Controller.AbortMultipartUpload(c.Request.Context(), auth.GetUserID(c.Request.Header), objectKey); err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	c.Status(http.StatusOK)
+}
+
 const legacyUploadsGoneMessage = "This upload API is no longer supported. Please update your app."
 
 func (h *FileHandler) RestrictLegacyUploads(c *gin.Context) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/ente/stacktrace"
+	"github.com/lib/pq"
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/pkg/utils/time"
@@ -25,18 +26,82 @@ func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, e
 	_, err := repo.DB.Exec(`
 		INSERT INTO temp_objects (
 		    object_key, expiration_time, upload_id, is_multipart, bucket_id,
-		    user_id, app, purpose, content_length, content_md5, client
-		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''))`,
+		    user_id, app, purpose, content_length, content_md5, client, part_length
+		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12)`,
 		tempObject.ObjectKey, expirationTime, tempObject.UploadID, tempObject.IsMultipart, tempObject.BucketId,
-		tempObject.UserID, tempObject.App, tempObject.Purpose, tempObject.ContentLength, tempObject.ContentMD5, tempObject.Client)
+		tempObject.UserID, tempObject.App, tempObject.Purpose, tempObject.ContentLength, tempObject.ContentMD5, tempObject.Client,
+		tempObject.PartLength)
 	return stacktrace.Propagate(err, "")
 }
 
 func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, objectKey string, userID int64) error {
-	_, err := repo.DB.ExecContext(ctx, `
-		UPDATE temp_objects SET expiration_time = $1
+	return expireTempObject(ctx, repo.DB, objectKey, userID, time.Microseconds())
+}
+
+func (repo *ObjectCleanupRepository) ExpireLockedTempObject(ctx context.Context, tx *sql.Tx, objectKey string, userID int64, now int64) error {
+	return expireTempObject(ctx, tx, objectKey, userID, now)
+}
+
+func expireTempObject(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, objectKey string, userID int64, now int64) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE temp_objects SET expiration_time = $1, reservation_released = TRUE
 		WHERE object_key = $2 AND user_id = $3 AND expiration_time > $1`,
-		time.Microseconds(), objectKey, userID)
+		now, objectKey, userID)
+	return stacktrace.Propagate(err, "")
+}
+
+var ErrTempObjectLocked = errors.New("temp object is locked by another transaction")
+
+type LockedTempObject struct {
+	ente.TempObject
+	ResumePartsCompleted int64
+}
+
+// NOWAIT: a concurrent resume, abort or Create can hold the row across S3
+// calls; fail fast rather than tie up a pooled connection waiting for it.
+func (repo *ObjectCleanupRepository) LockLiveTempObject(ctx context.Context, tx *sql.Tx, objectKey string, now int64) (LockedTempObject, error) {
+	var row LockedTempObject
+	var uploadID, bucketID, app, purpose sql.NullString
+	var userID, contentLength, partLength sql.NullInt64
+	err := tx.QueryRowContext(ctx, `
+		SELECT is_multipart, upload_id, bucket_id, user_id, app, purpose, content_length, part_length,
+		       COALESCE(resume_parts_completed, 0)
+		FROM temp_objects
+		WHERE object_key = $1 AND expiration_time > $2 AND NOT reservation_released
+		FOR UPDATE NOWAIT`, objectKey, now).
+		Scan(&row.IsMultipart, &uploadID, &bucketID, &userID, &app, &purpose, &contentLength, &partLength,
+			&row.ResumePartsCompleted)
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "55P03" {
+		return row, stacktrace.Propagate(ErrTempObjectLocked, "")
+	}
+	if err != nil {
+		return row, stacktrace.Propagate(err, "")
+	}
+	row.ObjectKey = objectKey
+	row.UploadID = uploadID.String
+	row.BucketId = bucketID.String
+	row.UserID = userID.Int64
+	row.App = ente.App(app.String)
+	row.Purpose = purpose.String
+	if contentLength.Valid {
+		row.ContentLength = &contentLength.Int64
+	}
+	if partLength.Valid {
+		row.PartLength = &partLength.Int64
+	}
+	return row, nil
+}
+
+func (repo *ObjectCleanupRepository) ExtendTempObjectExpiry(ctx context.Context, tx *sql.Tx, objectKey string, expiry int64, maxAge int64, partsCompleted *int64) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE temp_objects
+		SET expiration_time = GREATEST(expiration_time, LEAST($2, created_at + $3)),
+		    resume_parts_completed = COALESCE($4, resume_parts_completed)
+		WHERE object_key = $1`,
+		objectKey, expiry, maxAge, partsCompleted)
 	return stacktrace.Propagate(err, "")
 }
 

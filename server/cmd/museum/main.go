@@ -612,6 +612,8 @@ func main() {
 	storageAPI.GET("/files/multipart-upload-urls", fileHandler.RestrictLegacyUploads, fileHandler.GetMultipartUploadURLs)
 	storageAPI.POST("/files/upload-url", fileHandler.GetUploadURLV2)
 	storageAPI.POST("/files/multipart-upload-url", fileHandler.GetMultipartUploadURLV2)
+	storageAPI.POST("/files/multipart-upload-url/resume", fileHandler.ResumeMultipartUpload)
+	storageAPI.DELETE("/files/multipart-upload", fileHandler.AbortMultipartUpload)
 	storageAPI.GET("/files/download/:fileID", fileHandler.Get)
 	storageAPI.GET("/files/download/v2/:fileID", fileHandler.GetURL)
 	storageAPI.GET("/files/download/v3/:fileID", fileHandler.GetURLV3)

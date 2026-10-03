@@ -218,7 +218,9 @@ func isAuthenticatedUploadURLPath(reqPath string) bool {
 	return reqPath == "/files/upload-urls" ||
 		reqPath == "/files/upload-url" ||
 		reqPath == "/files/multipart-upload-urls" ||
-		reqPath == "/files/multipart-upload-url"
+		reqPath == "/files/multipart-upload-url" ||
+		reqPath == "/files/multipart-upload-url/resume" ||
+		reqPath == "/files/multipart-upload"
 }
 
 func isEventURLPath(reqPath string) bool {

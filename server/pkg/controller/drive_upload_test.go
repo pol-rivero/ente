@@ -51,7 +51,13 @@ func setupUploadLimitsTest(t *testing.T, storage int64) (*FileController, *sql.D
 		}
 	}))
 	t.Cleanup(s3Server.Close)
-	cleanup, fileRepo, db := setupObjectCleanupRaceTest(t, s3Server.URL)
+	c, db := newUploadTestController(t, s3Server.URL, storage)
+	return c, db, &multipartStarts
+}
+
+func newUploadTestController(t *testing.T, s3URL string, storage int64) (*FileController, *sql.DB) {
+	t.Helper()
+	cleanup, fileRepo, db := setupObjectCleanupRaceTest(t, s3URL)
 	testutil.InsertUser(t, db, testutil.UserFixture{UserID: uploadLimitsUserID, Email: "upload-limits@ente.com", CreationTime: 1})
 	testutil.InsertUsage(t, db, uploadLimitsUserID, 0)
 	testutil.InsertSubscription(t, db, testutil.SubscriptionFixture{
@@ -75,7 +81,7 @@ func setupUploadLimitsTest(t *testing.T, storage int64) (*FileController, *sql.D
 			},
 			UploadResultCache: make(map[int64]bool),
 		},
-	}, db, &multipartStarts
+	}, db
 }
 
 func uploadLimitsKey(name string, size int64) string {

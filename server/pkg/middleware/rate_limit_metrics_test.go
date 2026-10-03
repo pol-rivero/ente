@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/pkg/utils/auth"
@@ -83,4 +84,18 @@ func TestGetRateLimitKeyReturnsScopeForSelectedKey(t *testing.T) {
 	check("/users/srp/attributes", nil, "198.51.100.1-/users/srp/attributes", rateLimitScopeIP)
 	check("/public-collection/upload-url", ente.PublicAccessContext{CollectionID: 42}, "collection:42-/public-collection/upload-url", rateLimitScopeCollection)
 	check("/public-collection/upload-url", nil, "198.51.100.1-/public-collection/upload-url", rateLimitScopeIP)
+}
+
+func TestResumeAndAbortUseUploadURLRateLimiter(t *testing.T) {
+	rateLimiter := NewRateLimitMiddleware(nil, 1, time.Minute)
+	defer rateLimiter.Stop()
+	for _, tt := range []struct{ method, path string }{
+		{http.MethodPost, "/files/multipart-upload-url"},
+		{http.MethodPost, "/files/multipart-upload-url/resume"},
+		{http.MethodDelete, "/files/multipart-upload"},
+	} {
+		if got := rateLimiter.getLimiter(tt.path, tt.method); got != rateLimiter.limit500ReqPerMin {
+			t.Errorf("getLimiter(%s %s) is not the upload-URL limiter", tt.method, tt.path)
+		}
+	}
 }
