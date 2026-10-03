@@ -174,9 +174,10 @@ func TestFileCreateRequiresMatchingDriveCollection(t *testing.T) {
 	users := &repo.UserRepository{DB: db}
 	usageRepo := &repo.UsageRepository{DB: db}
 	controller := &FileController{
-		S3Config:       cleanup.S3Config,
-		FileRepo:       fileRepo,
-		CollectionRepo: &repo.CollectionRepository{DB: db, CollectionLinkRepo: public.NewCollectionLinkRepository(db, "")},
+		S3Config:          cleanup.S3Config,
+		FileRepo:          fileRepo,
+		ObjectCleanupRepo: cleanup.Repo,
+		CollectionRepo:    &repo.CollectionRepository{DB: db, CollectionLinkRepo: public.NewCollectionLinkRepository(db, "")},
 		UsageCtrl: &UsageController{
 			UserRepo: users, UsageRepo: usageRepo,
 			BillingCtrl: &BillingController{UserRepo: users, BillingRepo: &repo.BillingRepository{DB: db}},

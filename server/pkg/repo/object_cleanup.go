@@ -22,16 +22,66 @@ type ObjectCleanupRepository struct {
 	DB *sql.DB
 }
 
-func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, expirationTime int64) error {
-	_, err := repo.DB.Exec(`
+const insertTempObjectQuery = `
 		INSERT INTO temp_objects (
 		    object_key, expiration_time, upload_id, is_multipart, bucket_id,
 		    user_id, app, purpose, content_length, content_md5, client, part_length
-		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12)`,
-		tempObject.ObjectKey, expirationTime, tempObject.UploadID, tempObject.IsMultipart, tempObject.BucketId,
+		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12)`
+
+func insertTempObjectArgs(tempObject ente.TempObject, expirationTime int64) []any {
+	return []any{tempObject.ObjectKey, expirationTime, tempObject.UploadID, tempObject.IsMultipart, tempObject.BucketId,
 		tempObject.UserID, tempObject.App, tempObject.Purpose, tempObject.ContentLength, tempObject.ContentMD5, tempObject.Client,
-		tempObject.PartLength)
+		tempObject.PartLength}
+}
+
+func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, expirationTime int64) error {
+	_, err := repo.DB.Exec(insertTempObjectQuery, insertTempObjectArgs(tempObject, expirationTime)...)
 	return stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCleanupRepository) AddTempObjectTx(ctx context.Context, tx *sql.Tx, tempObject ente.TempObject, expirationTime int64) error {
+	_, err := tx.ExecContext(ctx, insertTempObjectQuery, insertTempObjectArgs(tempObject, expirationTime)...)
+	return stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, objectKey string, uploadID string) error {
+	res, err := repo.DB.ExecContext(ctx, `UPDATE temp_objects SET upload_id = $2 WHERE object_key = $1 AND upload_id IS NULL`,
+		objectKey, uploadID)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if rowsAffected != 1 {
+		return stacktrace.NewError("temp object %s not found to set its upload ID", objectKey)
+	}
+	return nil
+}
+
+// The quota sum (UsageRepository.GetUsageWithDriveReservations) and admission
+// at Create must agree on which rows hold a reservation. $1 is now.
+const liveDriveReservation = `t.app = 'drive' AND t.purpose = 'file_upload'
+	AND t.expiration_time > $1 AND NOT t.reservation_released`
+
+func (repo *ObjectCleanupRepository) HoldsDriveReservations(ctx context.Context, userID int64, sizes map[string]int64, now int64) (bool, error) {
+	keys := make([]string, 0, len(sizes))
+	lengths := make([]int64, 0, len(sizes))
+	for key, size := range sizes {
+		keys = append(keys, key)
+		lengths = append(lengths, size)
+	}
+	var reserved int
+	err := repo.DB.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM temp_objects t
+		JOIN unnest($3::text[], $4::bigint[]) AS c(object_key, size) ON c.object_key = t.object_key
+		WHERE t.user_id = $2 AND t.content_length >= c.size AND `+liveDriveReservation,
+		now, userID, pq.Array(keys), pq.Array(lengths)).Scan(&reserved)
+	if err != nil {
+		return false, stacktrace.Propagate(err, "")
+	}
+	return reserved == len(sizes), nil
 }
 
 func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, objectKey string, userID int64) error {
@@ -197,30 +247,21 @@ func (repo *ObjectCleanupRepository) GetAndLockExpiredObjects() (*sql.Tx, []ente
 	return tx, tempObjects, nil
 }
 
+// Filtering on object_key alone (the primary key) also matches multipart rows
+// whose upload_id is still NULL. A Drive row the cron has handled once is
+// released, so pushing its expiry forward doesn't put it back in the quota sum.
 func (repo *ObjectCleanupRepository) SetExpiryForTempObject(tx *sql.Tx, tempObject ente.TempObject, expirationTime int64) error {
-	if tempObject.IsMultipart {
-		_, err := tx.Exec(`
-			UPDATE temp_objects SET expiration_time = $1 WHERE object_key = $2 AND upload_id = $3
-			`, expirationTime, tempObject.ObjectKey, tempObject.UploadID)
-		return stacktrace.Propagate(err, "")
-	} else {
-		_, err := tx.Exec(`
-			UPDATE temp_objects SET expiration_time = $1 WHERE object_key = $2
-			`, expirationTime, tempObject.ObjectKey)
-		return stacktrace.Propagate(err, "")
-	}
+	_, err := tx.Exec(`
+		UPDATE temp_objects
+		SET expiration_time = $1, reservation_released = reservation_released OR app IS NOT DISTINCT FROM 'drive'
+		WHERE object_key = $2
+		`, expirationTime, tempObject.ObjectKey)
+	return stacktrace.Propagate(err, "")
 }
 
 func (repo *ObjectCleanupRepository) RemoveTempObject(tx *sql.Tx, tempObject ente.TempObject) error {
-	if tempObject.IsMultipart {
-		_, err := tx.Exec(`
-			DELETE FROM temp_objects WHERE object_key = $1 AND upload_id = $2
-			`, tempObject.ObjectKey, tempObject.UploadID)
-		return stacktrace.Propagate(err, "")
-	} else {
-		_, err := tx.Exec(`
-			DELETE FROM temp_objects WHERE object_key = $1
-			`, tempObject.ObjectKey)
-		return stacktrace.Propagate(err, "")
-	}
+	_, err := tx.Exec(`
+		DELETE FROM temp_objects WHERE object_key = $1
+		`, tempObject.ObjectKey)
+	return stacktrace.Propagate(err, "")
 }

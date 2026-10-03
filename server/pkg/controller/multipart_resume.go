@@ -183,8 +183,12 @@ func (c *FileController) lockOwnedDriveUpload(ctx context.Context, tx *sql.Tx, u
 	if upload.UserID != userID {
 		return upload, stacktrace.Propagate(&ente.ErrNotFoundError, "")
 	}
-	if upload.App != ente.Drive || !upload.IsMultipart || upload.Purpose != "file_upload" || upload.UploadID == "" {
+	if upload.App != ente.Drive || !upload.IsMultipart || upload.Purpose != "file_upload" {
 		return upload, stacktrace.Propagate(ente.NewBadRequestWithMessage("not a Drive multipart upload"), "")
+	}
+	// The start is still between committing the row and storing its upload ID.
+	if upload.UploadID == "" {
+		return upload, stacktrace.Propagate(ente.ErrUploadBusy, "")
 	}
 	return upload, nil
 }

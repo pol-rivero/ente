@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/ente/museum/pkg/controller/storagebonus"
 	"github.com/ente/museum/pkg/controller/usercache"
 	"github.com/ente/museum/pkg/repo"
+	"github.com/ente/museum/pkg/utils/time"
 	"github.com/ente/stacktrace"
 )
 
@@ -51,9 +53,19 @@ func GetLockerLimitsForTier(isPaid bool) LockerLimits {
 	return limits
 }
 
+type driveQuota struct {
+	excludedKeys []string
+	reserve      bool
+	tx           *sql.Tx
+}
+
 func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size *int64, app ente.App) error {
 	if app == ente.Locker {
-		return c.canUploadFile(ctx, userID, size, app)
+		return c.canUploadFile(ctx, userID, size, app, nil)
+	}
+	// Drive skips the cache, which keeps the Photos fast path driven by Photos checks only.
+	if app == ente.Drive {
+		return c.canUploadFile(ctx, userID, size, app, &driveQuota{})
 	}
 	if size == nil || *size < hundredMBInBytes {
 		c.mu.Lock()
@@ -69,15 +81,56 @@ func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size 
 	return c.checkAndUpdateCache(ctx, userID, size, app)
 }
 
+// The objects being committed are excluded from the reservation sum: their
+// size is already in sizeDelta.
+func (c *UsageController) CanCommitDriveObjects(ctx context.Context, userID int64, sizeDelta int64, objectKeys []string) error {
+	return c.canUploadFile(ctx, userID, &sizeDelta, ente.Drive, &driveQuota{excludedKeys: objectKeys})
+}
+
+// insert runs in the transaction holding the quota lock, so concurrent upload
+// starts for the same subscription can't both fit into the same free space.
+func (c *UsageController) ReserveDriveUpload(ctx context.Context, userID int64, size int64, insert func(tx *sql.Tx) error) error {
+	quota := &driveQuota{reserve: true}
+	defer func() {
+		if quota.tx != nil {
+			_ = quota.tx.Rollback()
+		}
+	}()
+	if err := c.canUploadFile(ctx, userID, &size, ente.Drive, quota); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if quota.tx == nil {
+		return stacktrace.NewError("quota check did not lock the subscription")
+	}
+	if err := insert(quota.tx); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	return stacktrace.Propagate(quota.tx.Commit(), "")
+}
+
+func (c *UsageController) readDriveUsage(ctx context.Context, quota *driveQuota, subscriptionAdminID int64, subscriptionUserIDs []int64, userID int64) (int64, int64, error) {
+	if quota.reserve {
+		tx, err := c.UsageRepo.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, 0, stacktrace.Propagate(err, "")
+		}
+		quota.tx = tx
+		if err := c.UsageRepo.LockQuota(ctx, tx, subscriptionAdminID); err != nil {
+			return 0, 0, stacktrace.Propagate(err, "")
+		}
+	}
+	return c.UsageRepo.GetUsageWithDriveReservations(ctx, quota.tx, time.Microseconds(), subscriptionUserIDs, userID, quota.excludedKeys)
+}
+
 func (c *UsageController) checkAndUpdateCache(ctx context.Context, userID int64, size *int64, app ente.App) error {
-	err := c.canUploadFile(ctx, userID, size, app)
+	err := c.canUploadFile(ctx, userID, size, app, nil)
 	c.mu.Lock()
 	c.UploadResultCache[userID] = err == nil
 	c.mu.Unlock()
 	return err
 }
 
-func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size *int64, app ente.App) error {
+func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size *int64, app ente.App, drive *driveQuota) error {
 	familyAdminID, err := c.UserRepo.GetFamilyAdminID(userID)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
@@ -153,7 +206,12 @@ func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size 
 		return nil
 	}
 
-	usage, err := c.UsageRepo.GetCombinedUsage(ctx, subscriptionUserIDs)
+	var usage, memberUsage int64
+	if drive != nil {
+		usage, memberUsage, err = c.readDriveUsage(ctx, drive, subscriptionAdminID, subscriptionUserIDs, userID)
+	} else {
+		usage, err = c.UsageRepo.GetCombinedUsage(ctx, subscriptionUserIDs)
+	}
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -185,9 +243,12 @@ func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size 
 	}
 
 	if subscriptionAdminID != userID && memberStorageLimit != nil {
-		memberUsage, memberUsageErr := c.UsageRepo.GetUsage(userID)
-		if memberUsageErr != nil {
-			return stacktrace.Propagate(memberUsageErr, "Couldn't get Members Usage")
+		if drive == nil {
+			var memberUsageErr error
+			memberUsage, memberUsageErr = c.UsageRepo.GetUsage(userID)
+			if memberUsageErr != nil {
+				return stacktrace.Propagate(memberUsageErr, "Couldn't get Members Usage")
+			}
 		}
 		if size != nil {
 			memberUsage += *size

@@ -104,3 +104,43 @@ func TestGetOwnerIDAndApp(t *testing.T) {
 		require.Equal(t, want, app, "stored app %q", stored)
 	}
 }
+
+func TestCleanupUpdatesMatchRowsByObjectKey(t *testing.T) {
+	_, db, userID := setupCollectionMembershipTest(t)
+	repo := &ObjectCleanupRepository{DB: db}
+	_, err := db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, is_multipart, upload_id) VALUES
+		('1/photos-multipart', 1, 'b2-eu-cen', $1, 'photos', TRUE, 'u'),
+		('1/drive-pending', 1, 'b2-eu-cen', $1, 'drive', TRUE, NULL),
+		('1/drive-single', 1, 'b2-eu-cen', $1, 'drive', FALSE, NULL),
+		('1/legacy', 1, 'b2-eu-cen', NULL, NULL, FALSE, NULL)`, userID)
+	require.NoError(t, err)
+	tx, objects, err := repo.GetAndLockExpiredObjects()
+	require.NoError(t, err)
+	defer tx.Rollback()
+	require.Len(t, objects, 4)
+	for _, object := range objects {
+		require.NoError(t, repo.SetExpiryForTempObject(tx, object, 42))
+	}
+	rows, err := tx.Query(`SELECT object_key, expiration_time, reservation_released FROM temp_objects`)
+	require.NoError(t, err)
+	released := make(map[string]bool)
+	for rows.Next() {
+		var key string
+		var expiry int64
+		var isReleased bool
+		require.NoError(t, rows.Scan(&key, &expiry, &isReleased))
+		require.Equal(t, int64(42), expiry, key)
+		released[key] = isReleased
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, map[string]bool{
+		"1/photos-multipart": false, "1/drive-pending": true, "1/drive-single": true, "1/legacy": false,
+	}, released)
+
+	for _, object := range objects {
+		require.NoError(t, repo.RemoveTempObject(tx, object))
+	}
+	var remaining int
+	require.NoError(t, tx.QueryRow(`SELECT COUNT(*) FROM temp_objects`).Scan(&remaining))
+	require.Zero(t, remaining)
+}

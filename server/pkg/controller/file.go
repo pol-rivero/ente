@@ -223,7 +223,12 @@ func (c *FileController) Create(ctx *gin.Context, userID int64, file ente.File, 
 	}
 	file.Thumbnail.Size = thumbnailSize
 	var totalUploadSize = fileSize + thumbnailSize
-	err = c.UsageCtrl.CanUploadFile(ctx, userID, &totalUploadSize, app)
+	if app == ente.Drive {
+		err = c.checkDriveCommitQuota(ctx, userID, totalUploadSize,
+			map[string]int64{file.File.ObjectKey: fileSize, file.Thumbnail.ObjectKey: thumbnailSize})
+	} else {
+		err = c.UsageCtrl.CanUploadFile(ctx, userID, &totalUploadSize, app)
+	}
 	if err != nil {
 		return file, stacktrace.Propagate(err, "")
 	}
@@ -332,7 +337,18 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 		return response, stacktrace.Propagate(ente.ErrBadRequest, "mismatch in thumbnail size")
 	}
 	diff := (fileSize + thumbnailSize) - (oldFileSize + oldThumbnailSize)
-	err = c.UsageCtrl.CanUploadFile(ctx, userID, &diff, app)
+	if app == ente.Drive || fileApp == ente.Drive {
+		staged := make(map[string]int64, 2)
+		if file.File.ObjectKey != existingFileObjectKey {
+			staged[file.File.ObjectKey] = fileSize
+		}
+		if file.Thumbnail.ObjectKey != existingThumbnailObjectKey {
+			staged[file.Thumbnail.ObjectKey] = thumbnailSize
+		}
+		err = c.checkDriveCommitQuota(ctx, userID, diff, staged)
+	} else {
+		err = c.UsageCtrl.CanUploadFile(ctx, userID, &diff, app)
+	}
 	if err != nil {
 		return response, stacktrace.Propagate(err, "")
 	}
@@ -362,6 +378,26 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 	response.ID = file.ID
 	response.UpdationTime = file.UpdationTime
 	return response, nil
+}
+
+// Admission is final: when every staged object holds a reservation, its bytes
+// were already checked at upload start, so quota consumed since then can't make
+// a finished upload fail. Partly reserved commits get the full check.
+func (c *FileController) checkDriveCommitQuota(ctx context.Context, userID int64, sizeDelta int64, staged map[string]int64) error {
+	if len(staged) > 0 {
+		reserved, err := c.ObjectCleanupRepo.HoldsDriveReservations(ctx, userID, staged, time.Microseconds())
+		if err != nil {
+			return stacktrace.Propagate(err, "")
+		}
+		if reserved {
+			return nil
+		}
+	}
+	keys := make([]string, 0, len(staged))
+	for key := range staged {
+		keys = append(keys, key)
+	}
+	return stacktrace.Propagate(c.UsageCtrl.CanCommitDriveObjects(ctx, userID, sizeDelta, keys), "")
 }
 
 // Not for quota rejections: clients retry those with the same object after upgrading.
@@ -431,25 +467,40 @@ func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID in
 	if err != nil {
 		return ente.UploadURL{}, err
 	}
-	if err := c.UsageCtrl.CanUploadFile(ctx, userID, &req.ContentLength, app); err != nil {
-		return ente.UploadURL{}, stacktrace.Propagate(err, "")
-	}
-	dc := c.S3Config.GetHotDataCenter()
-	objectKey := strconv.FormatInt(userID, 10) + "/" + uuid.NewString()
-	url, err := c.getObjectURL(ente.TempObject{
-		ObjectKey:     objectKey,
-		BucketId:      dc,
+	object := ente.TempObject{
+		ObjectKey:     strconv.FormatInt(userID, 10) + "/" + uuid.NewString(),
+		BucketId:      c.S3Config.GetHotDataCenter(),
 		UserID:        userID,
 		App:           app,
 		Purpose:       "file_upload",
 		ContentLength: &req.ContentLength,
 		ContentMD5:    &checksum,
 		Client:        client,
-	})
+	}
+	if app == ente.Drive {
+		url, err := c.presignObjectURL(object)
+		if err != nil {
+			return ente.UploadURL{}, stacktrace.Propagate(err, "")
+		}
+		if err := c.reserveDriveUpload(ctx, userID, object); err != nil {
+			return ente.UploadURL{}, stacktrace.Propagate(err, "")
+		}
+		return ente.UploadURL{ObjectKey: object.ObjectKey, URL: url}, nil
+	}
+	if err := c.UsageCtrl.CanUploadFile(ctx, userID, &req.ContentLength, app); err != nil {
+		return ente.UploadURL{}, stacktrace.Propagate(err, "")
+	}
+	url, err := c.getObjectURL(object)
 	if err != nil {
 		return ente.UploadURL{}, stacktrace.Propagate(err, "")
 	}
 	return url, nil
+}
+
+func (c *FileController) reserveDriveUpload(ctx context.Context, userID int64, object ente.TempObject) error {
+	return c.UsageCtrl.ReserveDriveUpload(ctx, userID, *object.ContentLength, func(tx *sql.Tx) error {
+		return c.ObjectCleanupCtrl.AddTempObjectTx(ctx, tx, object)
+	})
 }
 
 func (c *FileController) GetFileURL(ctx *gin.Context, userID int64, fileID int64) (string, error) {
@@ -777,7 +828,11 @@ func (c *FileController) UpdateThumbnail(ctx *gin.Context, fileID int64, newThum
 	if diff > 0 {
 		return stacktrace.Propagate(errors.New("new thumbnail larger than existing thumbnail"), "")
 	}
-	err = c.UsageCtrl.CanUploadFile(ctx, userID, &diff, app)
+	if app == ente.Drive {
+		err = c.UsageCtrl.CanCommitDriveObjects(ctx, userID, diff, []string{newThumbnail.ObjectKey})
+	} else {
+		err = c.UsageCtrl.CanUploadFile(ctx, userID, &diff, app)
+	}
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -1134,6 +1189,18 @@ func (c *FileController) deleteObjectVersionFromHotStorage(objectKey string, ver
 }
 
 func (c *FileController) getObjectURL(object ente.TempObject) (ente.UploadURL, error) {
+	url, err := c.presignObjectURL(object)
+	if err != nil {
+		return ente.UploadURL{}, stacktrace.Propagate(err, "")
+	}
+	err = c.ObjectCleanupCtrl.AddTempObject(object)
+	if err != nil {
+		return ente.UploadURL{}, stacktrace.Propagate(err, "")
+	}
+	return ente.UploadURL{ObjectKey: object.ObjectKey, URL: url}, nil
+}
+
+func (c *FileController) presignObjectURL(object ente.TempObject) (string, error) {
 	s3Client := c.S3Config.GetS3Client(object.BucketId)
 	input := &s3.PutObjectInput{
 		Bucket:        c.S3Config.GetBucket(object.BucketId),
@@ -1143,14 +1210,7 @@ func (c *FileController) getObjectURL(object ente.TempObject) (ente.UploadURL, e
 	}
 	r, _ := s3Client.PutObjectRequest(input)
 	url, err := r.Presign(PreSignedRequestValidityDuration)
-	if err != nil {
-		return ente.UploadURL{}, stacktrace.Propagate(err, "")
-	}
-	err = c.ObjectCleanupCtrl.AddTempObject(object)
-	if err != nil {
-		return ente.UploadURL{}, stacktrace.Propagate(err, "")
-	}
-	return ente.UploadURL{ObjectKey: object.ObjectKey, URL: url}, nil
+	return url, stacktrace.Propagate(err, "")
 }
 
 func (c *FileController) GetMultipartUploadURLs(ctx context.Context, userID int64, count int, app ente.App, client string) (ente.MultipartUploadURLs, error) {
@@ -1240,29 +1300,11 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 		}
 	}
 	partLengths := computePartLengths(req.ContentLength, req.PartLength, partCount)
-	// Photos mobile doesn't handle a 426 here, so only Drive passes the size.
-	var uploadSize *int64
-	if app == ente.Drive {
-		uploadSize = &req.ContentLength
-	}
-	if err := c.UsageCtrl.CanUploadFile(ctx, userID, uploadSize, app); err != nil {
-		return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
-	}
-	s3Client := c.S3Config.GetHotS3Client()
 	dc := c.S3Config.GetHotDataCenter()
-	bucket := c.S3Config.GetHotBucket()
 	objectKey := strconv.FormatInt(userID, 10) + "/" + uuid.NewString()
-	r, err := s3Client.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
-		Bucket: bucket,
-		Key:    &objectKey,
-	})
-	if err != nil {
-		return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
-	}
-	if err := c.ObjectCleanupCtrl.AddTempObject(ente.TempObject{
+	object := ente.TempObject{
 		ObjectKey:     objectKey,
 		IsMultipart:   true,
-		UploadID:      *r.UploadId,
 		BucketId:      dc,
 		UserID:        userID,
 		App:           app,
@@ -1270,8 +1312,30 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 		ContentLength: &req.ContentLength,
 		PartLength:    &req.PartLength,
 		Client:        client,
-	}); err != nil {
-		return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
+	}
+	var uploadID string
+	if app == ente.Drive {
+		uploadID, err = c.startReservedMultipartUpload(ctx, userID, object)
+		if err != nil {
+			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
+		}
+	} else {
+		// Photos mobile doesn't handle a 426 here, so only Drive passes the size.
+		if err := c.UsageCtrl.CanUploadFile(ctx, userID, nil, app); err != nil {
+			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
+		}
+		r, err := c.S3Config.GetHotS3Client().CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+			Bucket: c.S3Config.GetHotBucket(),
+			Key:    &objectKey,
+		})
+		if err != nil {
+			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
+		}
+		uploadID = *r.UploadId
+		object.UploadID = uploadID
+		if err := c.ObjectCleanupCtrl.AddTempObject(object); err != nil {
+			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
+		}
 	}
 	multipartUploadURLs := ente.MultipartUploadURLs{ObjectKey: objectKey}
 	urls := make([]string, 0, partCount)
@@ -1282,19 +1346,45 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 		if normalizedChecksums != nil {
 			checksum = &normalizedChecksums[i]
 		}
-		url, err := c.getPartURL(dc, objectKey, partNumber, r.UploadId, &length, checksum)
+		url, err := c.getPartURL(dc, objectKey, partNumber, &uploadID, &length, checksum)
 		if err != nil {
 			return multipartUploadURLs, stacktrace.Propagate(err, "")
 		}
 		urls = append(urls, url)
 	}
 	multipartUploadURLs.PartURLs = urls
-	url, err := c.getCompleteURL(dc, objectKey, r.UploadId)
+	url, err := c.getCompleteURL(dc, objectKey, &uploadID)
 	if err != nil {
 		return multipartUploadURLs, stacktrace.Propagate(err, "")
 	}
 	multipartUploadURLs.CompleteURL = url
 	return multipartUploadURLs, nil
+}
+
+// The quota lock mustn't be held across S3 calls, so the row is committed
+// before CreateMultipartUpload and gets its upload ID afterwards.
+func (c *FileController) startReservedMultipartUpload(ctx context.Context, userID int64, object ente.TempObject) (string, error) {
+	if err := c.reserveDriveUpload(ctx, userID, object); err != nil {
+		return "", stacktrace.Propagate(err, "")
+	}
+	r, err := c.S3Config.GetHotS3Client().CreateMultipartUploadWithContext(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: c.S3Config.GetHotBucket(),
+		Key:    &object.ObjectKey,
+	})
+	if err == nil {
+		err = c.ObjectCleanupRepo.SetTempObjectUploadID(context.WithoutCancel(ctx), object.ObjectKey, *r.UploadId)
+	}
+	if err != nil {
+		// The cleanup cron aborts any upload S3 created despite the error.
+		if expireErr := c.ObjectCleanupRepo.ExpireTempObjectNow(context.WithoutCancel(ctx), object.ObjectKey, userID); expireErr != nil {
+			log.WithError(expireErr).WithFields(log.Fields{
+				"user_id":    userID,
+				"object_key": object.ObjectKey,
+			}).Error("Failed to release the reservation of a failed multipart upload start")
+		}
+		return "", stacktrace.Propagate(err, "")
+	}
+	return *r.UploadId, nil
 }
 
 func (c *FileController) getPartURL(dc string, objectKey string, partNumber int64, uploadID *string, contentLength *int64, contentMD5 *string) (string, error) {

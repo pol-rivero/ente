@@ -144,7 +144,12 @@ func (c *ObjectCleanupController) removeUnreportedObject(tx *sql.Tx, t ente.Temp
 		return skip(stacktrace.Propagate(err, ""))
 	}
 
-	if t.IsMultipart {
+	if t.IsMultipart && t.UploadID == "" {
+		err = c.abortMultipartUploadsForKey(t.ObjectKey, dc)
+		if err != nil {
+			return skip(err)
+		}
+	} else if t.IsMultipart {
 		err = c.abortMultipartUpload(t.ObjectKey, t.UploadID, dc)
 		if err != nil {
 			return skip(err)
@@ -164,13 +169,21 @@ func (c *ObjectCleanupController) removeUnreportedObject(tx *sql.Tx, t ente.Temp
 }
 
 func (c *ObjectCleanupController) AddTempObject(object ente.TempObject) error {
+	err := c.Repo.AddTempObject(object, newTempObjectExpiry(object))
+	return stacktrace.Propagate(err, "")
+}
+
+func (c *ObjectCleanupController) AddTempObjectTx(ctx context.Context, tx *sql.Tx, object ente.TempObject) error {
+	err := c.Repo.AddTempObjectTx(ctx, tx, object, newTempObjectExpiry(object))
+	return stacktrace.Propagate(err, "")
+}
+
+func newTempObjectExpiry(object ente.TempObject) int64 {
 	validity := PreSignedRequestValidityDuration
 	if object.IsMultipart {
 		validity = PreSignedPartUploadRequestDuration
 	}
-	expiry := time.Microseconds() + 2*validity.Microseconds()
-	err := c.Repo.AddTempObject(object, expiry)
-	return stacktrace.Propagate(err, "")
+	return time.Microseconds() + 2*validity.Microseconds()
 }
 
 func (c *ObjectCleanupController) DeleteAllObjectsWithPrefix(prefix string, dc string) error {
@@ -258,6 +271,46 @@ func (c *ObjectCleanupController) disableConditionalHoldIfPresent(dc string, obj
 		return stacktrace.Propagate(err, "Failed to update ObjectCompliance for %s/%s", *bucket, objectKey)
 	}
 	return nil
+}
+
+// Drive rows get their upload ID only after CreateMultipartUpload returns, so
+// a crash or a failed start leaves the row without one.
+func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, dc string) error {
+	s3Client := c.S3Config.GetS3Client(dc)
+	var keyMarker, uploadIDMarker *string
+	for {
+		output, err := s3Client.ListMultipartUploads(&s3.ListMultipartUploadsInput{
+			Bucket:         c.S3Config.GetBucket(dc),
+			Prefix:         &objectKey,
+			KeyMarker:      keyMarker,
+			UploadIdMarker: uploadIDMarker,
+		})
+		if err != nil {
+			return stacktrace.Propagate(err, "")
+		}
+		for _, upload := range output.Uploads {
+			// The prefix also matches longer keys.
+			if aws.StringValue(upload.Key) != objectKey || aws.StringValue(upload.UploadId) == "" {
+				continue
+			}
+			if err := c.abortMultipartUpload(objectKey, *upload.UploadId, dc); err != nil {
+				return stacktrace.Propagate(err, "")
+			}
+		}
+		if !aws.BoolValue(output.IsTruncated) {
+			return nil
+		}
+		nextKey, nextUploadID := output.NextKeyMarker, output.NextUploadIdMarker
+		// Some S3-compatible stores omit the next markers.
+		if aws.StringValue(nextKey) == "" && len(output.Uploads) > 0 {
+			last := output.Uploads[len(output.Uploads)-1]
+			nextKey, nextUploadID = last.Key, last.UploadId
+		}
+		if aws.StringValue(nextKey) == aws.StringValue(keyMarker) && aws.StringValue(nextUploadID) == aws.StringValue(uploadIDMarker) {
+			return stacktrace.NewError("truncated multipart upload listing did not advance")
+		}
+		keyMarker, uploadIDMarker = nextKey, nextUploadID
+	}
 }
 
 func (c *ObjectCleanupController) abortMultipartUpload(objectKey string, uploadID string, dc string) error {

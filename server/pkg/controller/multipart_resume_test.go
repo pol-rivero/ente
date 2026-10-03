@@ -39,6 +39,10 @@ type fakeMultipartS3 struct {
 	headCalls       map[string]int
 	failAborts      bool
 	failDeletes     map[string]bool
+	failCreates     bool
+	beforeCreate    func(key string)
+	uploadsPageSize int
+	listUploadCalls int
 }
 
 type fakeMultipartUpload struct {
@@ -49,7 +53,7 @@ type fakeMultipartUpload struct {
 func newFakeMultipartS3(t *testing.T) (*fakeMultipartS3, string) {
 	t.Helper()
 	fake := &fakeMultipartS3{
-		t: t, uploads: map[string]*fakeMultipartUpload{}, objects: map[string]int64{}, pageSize: 1000,
+		t: t, uploads: map[string]*fakeMultipartUpload{}, objects: map[string]int64{}, pageSize: 1000, uploadsPageSize: 1000,
 		headMisses: map[string]int{}, headCalls: map[string]int{}, failDeletes: map[string]bool{},
 	}
 	server := httptest.NewServer(fake)
@@ -58,18 +62,35 @@ func newFakeMultipartS3(t *testing.T) (*fakeMultipartS3, string) {
 }
 
 func (f *fakeMultipartS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
+	query := r.URL.Query()
+	isCreate := r.Method == http.MethodPost && query.Has("uploads")
+	f.mu.Lock()
+	beforeCreate := f.beforeCreate
+	f.mu.Unlock()
+	if isCreate && beforeCreate != nil {
+		beforeCreate(key)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests++
-	key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
-	query := r.URL.Query()
 	uploadID := query.Get("uploadId")
+	if query.Has("uploadId") && uploadID == "" {
+		f.t.Errorf("storage request with an empty upload ID: %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	switch {
-	case r.Method == http.MethodPost && query.Has("uploads"):
+	case isCreate && f.failCreates:
+		writeAccessDenied(w)
+	case isCreate:
 		f.nextID++
 		uploadID = fmt.Sprintf("upload-%d", f.nextID)
 		f.uploads[uploadID] = &fakeMultipartUpload{key: key, parts: map[int64]int64{}}
 		_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, key, uploadID)
+	case r.Method == http.MethodGet && query.Has("uploads"):
+		f.listUploadCalls++
+		f.writeUploads(w, query.Get("prefix"), query.Get("key-marker"), query.Get("upload-id-marker"))
 	case uploadID != "":
 		upload, ok := f.uploads[uploadID]
 		if !ok || upload.key != key {
@@ -153,6 +174,42 @@ func (f *fakeMultipartS3) writeParts(w http.ResponseWriter, upload *fakeMultipar
 	}
 	body.WriteString(`</ListPartsResult>`)
 	_, _ = w.Write([]byte(body.String()))
+}
+
+func (f *fakeMultipartS3) writeUploads(w http.ResponseWriter, prefix, keyMarker, uploadIDMarker string) {
+	type listed struct{ key, id string }
+	uploads := make([]listed, 0)
+	for id, upload := range f.uploads {
+		after := upload.key > keyMarker || (upload.key == keyMarker && id > uploadIDMarker)
+		if strings.HasPrefix(upload.key, prefix) && after {
+			uploads = append(uploads, listed{upload.key, id})
+		}
+	}
+	slices.SortFunc(uploads, func(a, b listed) int { return strings.Compare(a.key+"\x00"+a.id, b.key+"\x00"+b.id) })
+	truncated := len(uploads) > f.uploadsPageSize
+	if truncated {
+		uploads = uploads[:f.uploadsPageSize]
+	}
+	var body strings.Builder
+	fmt.Fprintf(&body, `<ListMultipartUploadsResult><Bucket>test-bucket</Bucket><IsTruncated>%t</IsTruncated>`, truncated)
+	if truncated {
+		last := uploads[len(uploads)-1]
+		fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, last.key, last.id)
+	}
+	for _, upload := range uploads {
+		fmt.Fprintf(&body, `<Upload><Key>%s</Key><UploadId>%s</UploadId></Upload>`, upload.key, upload.id)
+	}
+	body.WriteString(`</ListMultipartUploadsResult>`)
+	_, _ = w.Write([]byte(body.String()))
+}
+
+func (f *fakeMultipartS3) startUpload(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	id := fmt.Sprintf("upload-%d", f.nextID)
+	f.uploads[id] = &fakeMultipartUpload{key: key, parts: map[int64]int64{}}
+	return id
 }
 
 func (f *fakeMultipartS3) upload(key string) *fakeMultipartUpload {

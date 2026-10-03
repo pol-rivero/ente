@@ -77,6 +77,39 @@ func (repo *UsageRepository) GetCombinedUsage(ctx context.Context, userIDs []int
 	return totalUsage, stacktrace.Propagate(err, "")
 }
 
+func (repo *UsageRepository) LockQuota(ctx context.Context, tx *sql.Tx, subscriptionAdminID int64) error {
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1::bigint, 0))`, subscriptionAdminID)
+	return stacktrace.Propagate(err, "")
+}
+
+// One statement, so both sums come from the same snapshot: FileRepository.Create
+// moves bytes from temp_objects to usage in one transaction, and two separate
+// reads could see neither.
+func (repo *UsageRepository) GetUsageWithDriveReservations(ctx context.Context, tx *sql.Tx, now int64, userIDs []int64, memberID int64, excludedKeys []string) (combined int64, member int64, err error) {
+	if excludedKeys == nil {
+		// pq sends a nil slice as NULL, and "<> ALL(NULL)" matches no rows.
+		excludedKeys = []string{}
+	}
+	query := repo.DB.QueryRowContext
+	if tx != nil {
+		query = tx.QueryRowContext
+	}
+	var usage, memberUsage, reserved, memberReserved int64
+	err = query(ctx, `
+		SELECT
+			(SELECT COALESCE(SUM(storage_consumed), 0) FROM usage WHERE user_id = ANY($2)),
+			(SELECT COALESCE(SUM(storage_consumed), 0) FROM usage WHERE user_id = $3),
+			COALESCE(SUM(t.content_length), 0),
+			COALESCE(SUM(t.content_length) FILTER (WHERE t.user_id = $3), 0)
+		FROM temp_objects t
+		WHERE t.user_id = ANY($2) AND t.object_key <> ALL($4::text[]) AND `+liveDriveReservation,
+		now, pq.Array(userIDs), memberID, pq.Array(excludedKeys)).Scan(&usage, &memberUsage, &reserved, &memberReserved)
+	if err != nil {
+		return 0, 0, stacktrace.Propagate(err, "")
+	}
+	return usage + reserved, memberUsage + memberReserved, nil
+}
+
 func (repo *UsageRepository) GetStorageWarningCandidates(ctx context.Context, usageThreshold int64) ([]StorageWarningCandidate, error) {
 	// Intentionally use per-member usage when selecting family candidates. The
 	// mailer evaluates aggregate family usage later, but candidate selection is
