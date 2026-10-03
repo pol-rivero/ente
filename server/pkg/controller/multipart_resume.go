@@ -47,6 +47,13 @@ func (c *FileController) ResumeMultipartUpload(ctx context.Context, userID int64
 	if err != nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 	}
+	if !upload.IsMultipart {
+		if upload.PartLength != nil {
+			// A multipart start that hasn't stored its upload ID yet.
+			return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadBusy, "")
+		}
+		return ente.MultipartUploadResume{}, stacktrace.Propagate(notDriveMultipartUpload(), "")
+	}
 	if upload.ContentLength == nil || upload.PartLength == nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.NewBadRequestWithMessage("upload is not resumable"), "")
 	}
@@ -124,7 +131,9 @@ func (c *FileController) resumeAssembledUpload(ctx context.Context, tx *sql.Tx, 
 }
 
 // The row is kept: after a completed upload it is the only record of the
-// object, and the cleanup cron deletes it only if it was never committed.
+// object, and the cleanup cron deletes it only if it was never committed. For
+// single PUTs and multipart starts without an upload ID yet, the cron also
+// deletes or aborts whatever reached storage.
 func (c *FileController) AbortMultipartUpload(ctx context.Context, userID int64, objectKey string) error {
 	if err := requireOwnObjectKey(userID, objectKey); err != nil {
 		return err
@@ -132,6 +141,9 @@ func (c *FileController) AbortMultipartUpload(ctx context.Context, userID int64,
 	upload, err := c.expireOwnedDriveUpload(ctx, userID, objectKey)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
+	}
+	if !upload.IsMultipart {
+		return nil
 	}
 	// Best effort: the row is already expired, so the cleanup cron aborts the
 	// upload if this fails or the client disconnects.
@@ -183,14 +195,14 @@ func (c *FileController) lockOwnedDriveUpload(ctx context.Context, tx *sql.Tx, u
 	if upload.UserID != userID {
 		return upload, stacktrace.Propagate(&ente.ErrNotFoundError, "")
 	}
-	if upload.App != ente.Drive || !upload.IsMultipart || upload.Purpose != "file_upload" {
-		return upload, stacktrace.Propagate(ente.NewBadRequestWithMessage("not a Drive multipart upload"), "")
-	}
-	// The start is still between committing the row and storing its upload ID.
-	if upload.UploadID == "" {
-		return upload, stacktrace.Propagate(ente.ErrUploadBusy, "")
+	if upload.App != ente.Drive || upload.Purpose != "file_upload" {
+		return upload, stacktrace.Propagate(notDriveMultipartUpload(), "")
 	}
 	return upload, nil
+}
+
+func notDriveMultipartUpload() error {
+	return ente.NewBadRequestWithMessage("not a Drive multipart upload")
 }
 
 func (c *FileController) uploadDataCenter(upload repo.LockedTempObject) string {

@@ -108,11 +108,11 @@ func TestGetOwnerIDAndApp(t *testing.T) {
 func TestCleanupUpdatesMatchRowsByObjectKey(t *testing.T) {
 	_, db, userID := setupCollectionMembershipTest(t)
 	repo := &ObjectCleanupRepository{DB: db}
-	_, err := db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, is_multipart, upload_id) VALUES
-		('1/photos-multipart', 1, 'b2-eu-cen', $1, 'photos', TRUE, 'u'),
-		('1/drive-pending', 1, 'b2-eu-cen', $1, 'drive', TRUE, NULL),
-		('1/drive-single', 1, 'b2-eu-cen', $1, 'drive', FALSE, NULL),
-		('1/legacy', 1, 'b2-eu-cen', NULL, NULL, FALSE, NULL)`, userID)
+	_, err := db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, is_multipart, upload_id, part_length) VALUES
+		('1/photos-multipart', 1, 'b2-eu-cen', $1, 'photos', TRUE, 'u', 10),
+		('1/drive-pending', 1, 'b2-eu-cen', $1, 'drive', FALSE, NULL, 10),
+		('1/drive-single', 1, 'b2-eu-cen', $1, 'drive', FALSE, NULL, NULL),
+		('1/legacy', 1, 'b2-eu-cen', NULL, NULL, FALSE, NULL, NULL)`, userID)
 	require.NoError(t, err)
 	tx, objects, err := repo.GetAndLockExpiredObjects()
 	require.NoError(t, err)

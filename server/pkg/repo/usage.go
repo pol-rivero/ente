@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/ente/stacktrace"
 	"github.com/lib/pq"
@@ -77,15 +79,33 @@ func (repo *UsageRepository) GetCombinedUsage(ctx context.Context, userIDs []int
 	return totalUsage, stacktrace.Propagate(err, "")
 }
 
-func (repo *UsageRepository) LockQuota(ctx context.Context, tx *sql.Tx, subscriptionAdminID int64) error {
+// lock_timeout backs up the caller's context deadline: a waiter holds a pooled
+// connection until it gets the lock.
+func (repo *UsageRepository) LockQuota(ctx context.Context, tx *sql.Tx, subscriptionAdminID int64, timeout time.Duration) error {
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = %d`, timeout.Milliseconds())); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
 	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1::bigint, 0))`, subscriptionAdminID)
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "55P03" {
+		return stacktrace.Propagate(ErrQuotaLockTimeout, "%v", err)
+	}
 	return stacktrace.Propagate(err, "")
 }
 
-// One statement, so both sums come from the same snapshot: FileRepository.Create
-// moves bytes from temp_objects to usage in one transaction, and two separate
-// reads could see neither.
-func (repo *UsageRepository) GetUsageWithDriveReservations(ctx context.Context, tx *sql.Tx, now int64, userIDs []int64, memberID int64, excludedKeys []string) (combined int64, member int64, err error) {
+var ErrQuotaLockTimeout = errors.New("timed out waiting for the quota lock")
+
+// Combined and Member include live Drive reservations.
+type DriveUsage struct {
+	Combined int64
+	Member   int64
+	Locker   int64
+}
+
+// One statement, so all sums come from the same snapshot: FileRepository.Create
+// moves bytes from temp_objects to usage in one transaction, and separate reads
+// could see neither (or count a Locker file in only one of them).
+func (repo *UsageRepository) GetUsageWithDriveReservations(ctx context.Context, tx *sql.Tx, now int64, userIDs []int64, memberID int64, excludedKeys []string) (DriveUsage, error) {
 	if excludedKeys == nil {
 		// pq sends a nil slice as NULL, and "<> ALL(NULL)" matches no rows.
 		excludedKeys = []string{}
@@ -94,20 +114,21 @@ func (repo *UsageRepository) GetUsageWithDriveReservations(ctx context.Context, 
 	if tx != nil {
 		query = tx.QueryRowContext
 	}
-	var usage, memberUsage, reserved, memberReserved int64
-	err = query(ctx, `
+	var usage, memberUsage, locker, reserved, memberReserved int64
+	err := query(ctx, `
 		SELECT
-			(SELECT COALESCE(SUM(storage_consumed), 0) FROM usage WHERE user_id = ANY($2)),
+			(SELECT COALESCE(SUM(storage_consumed), 0) FROM usage WHERE user_id = ANY($1)),
 			(SELECT COALESCE(SUM(storage_consumed), 0) FROM usage WHERE user_id = $3),
+			(SELECT COALESCE(SUM(total_size), 0) FROM (`+lockerStorageQuery+`) AS locker),
 			COALESCE(SUM(t.content_length), 0),
 			COALESCE(SUM(t.content_length) FILTER (WHERE t.user_id = $3), 0)
 		FROM temp_objects t
-		WHERE t.user_id = ANY($2) AND t.object_key <> ALL($4::text[]) AND `+liveDriveReservation,
-		now, pq.Array(userIDs), memberID, pq.Array(excludedKeys)).Scan(&usage, &memberUsage, &reserved, &memberReserved)
+		WHERE t.user_id = ANY($1) AND t.object_key <> ALL($4::text[]) AND `+liveDriveReservation,
+		pq.Array(userIDs), now, memberID, pq.Array(excludedKeys)).Scan(&usage, &memberUsage, &locker, &reserved, &memberReserved)
 	if err != nil {
-		return 0, 0, stacktrace.Propagate(err, "")
+		return DriveUsage{}, stacktrace.Propagate(err, "")
 	}
-	return usage + reserved, memberUsage + memberReserved, nil
+	return DriveUsage{Combined: usage + reserved, Member: memberUsage + memberReserved, Locker: locker}, nil
 }
 
 func (repo *UsageRepository) GetStorageWarningCandidates(ctx context.Context, usageThreshold int64) ([]StorageWarningCandidate, error) {
@@ -158,6 +179,23 @@ func (repo *UsageRepository) GetLockerUsage(ctx context.Context, userIDs []int64
 func (repo *UsageRepository) GetLockerStorageUsage(ctx context.Context, userIDs []int64) (*LockerUsage, error) {
 	return repo.getLockerUsage(ctx, userIDs, false)
 }
+
+// $1 is the owners' user IDs.
+const lockerStorageQuery = `
+      SELECT 
+         unique_files.owner_id,
+         COALESCE(SUM(ok.size), 0) AS total_size
+      FROM (
+         SELECT DISTINCT c.owner_id, cf.file_id
+         FROM collections c
+         JOIN collection_files cf ON c.collection_id = cf.collection_id
+         WHERE c.app = 'locker'
+            AND c.owner_id = ANY($1)
+            AND cf.f_owner_id = c.owner_id
+      ) AS unique_files
+      LEFT JOIN object_keys ok ON ok.file_id = unique_files.file_id AND ok.is_deleted = false
+      GROUP BY unique_files.owner_id
+   `
 
 func (repo *UsageRepository) getLockerUsage(ctx context.Context, userIDs []int64, includeFileCounts bool) (*LockerUsage, error) {
 	usage := &LockerUsage{}
@@ -224,23 +262,7 @@ func (repo *UsageRepository) getLockerUsage(ctx context.Context, userIDs []int64
 		}
 	}
 
-	sizeQuery := `
-      SELECT 
-         unique_files.owner_id,
-         COALESCE(SUM(ok.size), 0) AS total_size
-      FROM (
-         SELECT DISTINCT c.owner_id, cf.file_id
-         FROM collections c
-         JOIN collection_files cf ON c.collection_id = cf.collection_id
-         WHERE c.app = 'locker'
-            AND c.owner_id = ANY($1)
-            AND cf.f_owner_id = c.owner_id
-      ) AS unique_files
-      LEFT JOIN object_keys ok ON ok.file_id = unique_files.file_id AND ok.is_deleted = false
-      GROUP BY unique_files.owner_id;
-   `
-
-	rows, err := repo.DB.QueryContext(ctx, sizeQuery, pq.Array(userIDs))
+	rows, err := repo.DB.QueryContext(ctx, lockerStorageQuery, pq.Array(userIDs))
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "")
 	}

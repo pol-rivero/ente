@@ -42,8 +42,17 @@ type fakeMultipartS3 struct {
 	failCreates     bool
 	beforeCreate    func(key string)
 	uploadsPageSize int
+	uploadsMarkers  uploadsMarkerMode
 	listUploadCalls int
 }
+
+type uploadsMarkerMode int
+
+const (
+	uploadsMarkersNormal uploadsMarkerMode = iota
+	uploadsMarkersOmitUploadID
+	uploadsMarkersEchoRequest
+)
 
 type fakeMultipartUpload struct {
 	key   string
@@ -193,8 +202,14 @@ func (f *fakeMultipartS3) writeUploads(w http.ResponseWriter, prefix, keyMarker,
 	var body strings.Builder
 	fmt.Fprintf(&body, `<ListMultipartUploadsResult><Bucket>test-bucket</Bucket><IsTruncated>%t</IsTruncated>`, truncated)
 	if truncated {
-		last := uploads[len(uploads)-1]
-		fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, last.key, last.id)
+		nextKey, nextID := uploads[len(uploads)-1].key, uploads[len(uploads)-1].id
+		switch f.uploadsMarkers {
+		case uploadsMarkersOmitUploadID:
+			nextID = ""
+		case uploadsMarkersEchoRequest:
+			nextKey, nextID = keyMarker, uploadIDMarker
+		}
+		fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, nextKey, nextID)
 	}
 	for _, upload := range uploads {
 		fmt.Fprintf(&body, `<Upload><Key>%s</Key><UploadId>%s</UploadId></Upload>`, upload.key, upload.id)
@@ -606,7 +621,7 @@ func TestResumeAndAbortRejectForeignAndUnsupportedUploads(t *testing.T) {
 		{key: "1/missing", resumeCheck: gone, abortCheck: gone},
 		{key: "1/expired", resumeCheck: gone, abortCheck: gone},
 		{key: "1/copy", resumeCheck: notDrive, abortCheck: notDrive},
-		{key: single.ObjectKey, resumeCheck: notDrive, abortCheck: notDrive},
+		{key: single.ObjectKey, resumeCheck: notDrive},
 		{key: photos.ObjectKey, resumeCheck: notDrive, abortCheck: notDrive},
 		{key: locker.ObjectKey, resumeCheck: notDrive, abortCheck: notDrive},
 		{key: "1/v1", resumeCheck: func(err error) { requireBadRequestMessage(t, err, "upload is not resumable") }},
@@ -821,6 +836,7 @@ func TestNonDriveMultipartUploadsUnchanged(t *testing.T) {
 	_, err = db.Exec(`UPDATE temp_objects SET expiration_time = 1`)
 	require.NoError(t, err)
 	require.Equal(t, 3, c.ObjectCleanupCtrl.removeUnreportedObjects())
+	require.Zero(t, fake.listUploadCalls)
 	var remaining int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM temp_objects`).Scan(&remaining))
 	require.Zero(t, remaining)

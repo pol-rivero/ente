@@ -63,8 +63,6 @@ func newUploadTestController(t *testing.T, s3URL string, storage int64) (*FileCo
 	testutil.InsertSubscription(t, db, testutil.SubscriptionFixture{
 		UserID: uploadLimitsUserID, Storage: storage, ExpiryTime: gotime.Now().Add(gotime.Hour).UnixMicro(),
 	})
-	users := &repo.UserRepository{DB: db}
-	usageRepo := &repo.UsageRepository{DB: db}
 	return &FileController{
 		S3Config:          cleanup.S3Config,
 		ObjectCleanupCtrl: cleanup,
@@ -73,15 +71,21 @@ func newUploadTestController(t *testing.T, s3URL string, storage int64) (*FileCo
 		ObjectRepo:        fileRepo.ObjectRepo,
 		CollectionRepo:    &repo.CollectionRepository{DB: db, CollectionLinkRepo: public.NewCollectionLinkRepository(db, "")},
 		RemoteStoreRepo:   &remotestore.Repository{DB: db},
-		UsageCtrl: &UsageController{
-			UserRepo: users, UsageRepo: usageRepo, FamilyRepo: &repo.FamilyRepository{DB: db},
-			BillingCtrl: &BillingController{UserRepo: users, BillingRepo: &repo.BillingRepository{DB: db}},
-			UserCacheCtrl: &usercache.Controller{
-				UsageRepo: usageRepo, StoreBonusRepo: &storagebonusrepo.Repository{DB: db}, UserCache: cache.NewUserCache(),
-			},
-			UploadResultCache: make(map[int64]bool),
-		},
+		UsageCtrl:         newTestUsageController(db),
 	}, db
+}
+
+func newTestUsageController(db *sql.DB) *UsageController {
+	users := &repo.UserRepository{DB: db}
+	usageRepo := &repo.UsageRepository{DB: db}
+	return &UsageController{
+		UserRepo: users, UsageRepo: usageRepo, FamilyRepo: &repo.FamilyRepository{DB: db},
+		BillingCtrl: &BillingController{UserRepo: users, BillingRepo: &repo.BillingRepository{DB: db}},
+		UserCacheCtrl: &usercache.Controller{
+			UsageRepo: usageRepo, StoreBonusRepo: &storagebonusrepo.Repository{DB: db}, UserCache: cache.NewUserCache(),
+		},
+		UploadResultCache: make(map[int64]bool),
+	}
 }
 
 func uploadLimitsKey(name string, size int64) string {

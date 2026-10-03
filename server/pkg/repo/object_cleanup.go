@@ -25,13 +25,13 @@ type ObjectCleanupRepository struct {
 const insertTempObjectQuery = `
 		INSERT INTO temp_objects (
 		    object_key, expiration_time, upload_id, is_multipart, bucket_id,
-		    user_id, app, purpose, content_length, content_md5, client, part_length
-		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12)`
+		    user_id, app, purpose, content_length, content_md5, client, part_length, reservation_released
+		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12, $13)`
 
 func insertTempObjectArgs(tempObject ente.TempObject, expirationTime int64) []any {
 	return []any{tempObject.ObjectKey, expirationTime, tempObject.UploadID, tempObject.IsMultipart, tempObject.BucketId,
 		tempObject.UserID, tempObject.App, tempObject.Purpose, tempObject.ContentLength, tempObject.ContentMD5, tempObject.Client,
-		tempObject.PartLength}
+		tempObject.PartLength, tempObject.ReservationReleased}
 }
 
 func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, expirationTime int64) error {
@@ -44,9 +44,19 @@ func (repo *ObjectCleanupRepository) AddTempObjectTx(ctx context.Context, tx *sq
 	return stacktrace.Propagate(err, "")
 }
 
-func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, objectKey string, uploadID string) error {
-	res, err := repo.DB.ExecContext(ctx, `UPDATE temp_objects SET upload_id = $2 WHERE object_key = $1 AND upload_id IS NULL`,
-		objectKey, uploadID)
+// A reserved multipart start is inserted before CreateMultipartUpload as a
+// "pending" row: is_multipart = FALSE and upload_id NULL, with part_length set.
+// Older binaries' cleanup cron then deletes it like an unused single PUT
+// instead of calling AbortMultipartUpload with an empty upload ID.
+//
+// Expired or released rows aren't updated: the cron may hold them locked
+// across S3 calls, and their upload was cancelled anyway.
+func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, objectKey string, uploadID string, now int64) error {
+	res, err := repo.DB.ExecContext(ctx, `
+		UPDATE temp_objects SET upload_id = $2, is_multipart = TRUE
+		WHERE object_key = $1 AND upload_id IS NULL AND NOT is_multipart
+		  AND expiration_time > $3 AND NOT reservation_released`,
+		objectKey, uploadID, now)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -55,33 +65,41 @@ func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, 
 		return stacktrace.Propagate(err, "")
 	}
 	if rowsAffected != 1 {
-		return stacktrace.NewError("temp object %s not found to set its upload ID", objectKey)
+		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to set its upload ID", objectKey)
 	}
 	return nil
 }
 
 // The quota sum (UsageRepository.GetUsageWithDriveReservations) and admission
-// at Create must agree on which rows hold a reservation. $1 is now.
+// at Create must agree on which rows hold a reservation. $2 is now.
 const liveDriveReservation = `t.app = 'drive' AND t.purpose = 'file_upload'
-	AND t.expiration_time > $1 AND NOT t.reservation_released`
+	AND t.expiration_time > $2 AND NOT t.reservation_released`
 
-func (repo *ObjectCleanupRepository) HoldsDriveReservations(ctx context.Context, userID int64, sizes map[string]int64, now int64) (bool, error) {
+func (repo *ObjectCleanupRepository) GetDriveReservedKeys(ctx context.Context, userID int64, sizes map[string]int64, now int64) (map[string]bool, error) {
 	keys := make([]string, 0, len(sizes))
 	lengths := make([]int64, 0, len(sizes))
 	for key, size := range sizes {
 		keys = append(keys, key)
 		lengths = append(lengths, size)
 	}
-	var reserved int
-	err := repo.DB.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM temp_objects t
+	rows, err := repo.DB.QueryContext(ctx, `
+		SELECT t.object_key FROM temp_objects t
 		JOIN unnest($3::text[], $4::bigint[]) AS c(object_key, size) ON c.object_key = t.object_key
-		WHERE t.user_id = $2 AND t.content_length >= c.size AND `+liveDriveReservation,
-		now, userID, pq.Array(keys), pq.Array(lengths)).Scan(&reserved)
+		WHERE t.user_id = $1 AND t.content_length >= c.size AND `+liveDriveReservation,
+		userID, now, pq.Array(keys), pq.Array(lengths))
 	if err != nil {
-		return false, stacktrace.Propagate(err, "")
+		return nil, stacktrace.Propagate(err, "")
 	}
-	return reserved == len(sizes), nil
+	defer rows.Close()
+	reserved := make(map[string]bool, len(sizes))
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		reserved[key] = true
+	}
+	return reserved, stacktrace.Propagate(rows.Err(), "")
 }
 
 func (repo *ObjectCleanupRepository) ExpireTempObjectNow(ctx context.Context, objectKey string, userID int64) error {
@@ -212,7 +230,7 @@ func (repo *ObjectCleanupRepository) GetAndLockExpiredObjects() (*sql.Tx, []ente
 	}()
 
 	rows, err := tx.Query(`
-	SELECT object_key, is_multipart, upload_id, bucket_id FROM temp_objects
+	SELECT object_key, is_multipart, upload_id, bucket_id, part_length FROM temp_objects
 	WHERE expiration_time <= $1
 	LIMIT 1000
 	FOR UPDATE SKIP LOCKED
@@ -228,7 +246,8 @@ func (repo *ObjectCleanupRepository) GetAndLockExpiredObjects() (*sql.Tx, []ente
 		var tempObject ente.TempObject
 		var uploadID sql.NullString
 		var bucketID sql.NullString
-		err := rows.Scan(&tempObject.ObjectKey, &tempObject.IsMultipart, &uploadID, &bucketID)
+		var partLength sql.NullInt64
+		err := rows.Scan(&tempObject.ObjectKey, &tempObject.IsMultipart, &uploadID, &bucketID, &partLength)
 		if err != nil {
 			return nil, nil, stacktrace.Propagate(err, "")
 		}
@@ -237,6 +256,9 @@ func (repo *ObjectCleanupRepository) GetAndLockExpiredObjects() (*sql.Tx, []ente
 		}
 		if bucketID.Valid {
 			tempObject.BucketId = bucketID.String
+		}
+		if partLength.Valid {
+			tempObject.PartLength = &partLength.Int64
 		}
 		tempObjects = append(tempObjects, tempObject)
 	}

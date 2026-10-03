@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sync"
+	gTime "time"
 
 	"github.com/ente/museum/ente"
 	bonus "github.com/ente/museum/ente/storagebonus"
@@ -53,19 +54,24 @@ func GetLockerLimitsForTier(isPaid bool) LockerLimits {
 	return limits
 }
 
-type driveQuota struct {
-	excludedKeys []string
-	reserve      bool
-	tx           *sql.Tx
-}
+const maxConcurrentDriveReservations = 8
+
+// Reservation transactions hold a pooled connection while they wait for the
+// quota lock. The slots bound how many can wait at once (waiting for a slot
+// holds no connection), and the timeout bounds the slot wait plus the
+// transaction.
+var (
+	driveReservationSlots   = make(chan struct{}, maxConcurrentDriveReservations)
+	driveReservationTimeout = 10 * gTime.Second
+)
 
 func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size *int64, app ente.App) error {
 	if app == ente.Locker {
-		return c.canUploadFile(ctx, userID, size, app, nil)
+		return c.canUploadFile(ctx, userID, size, app)
 	}
 	// Drive skips the cache, which keeps the Photos fast path driven by Photos checks only.
 	if app == ente.Drive {
-		return c.canUploadFile(ctx, userID, size, app, &driveQuota{})
+		return c.canUploadDriveFile(ctx, userID, size, nil)
 	}
 	if size == nil || *size < hundredMBInBytes {
 		c.mu.Lock()
@@ -81,140 +87,203 @@ func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size 
 	return c.checkAndUpdateCache(ctx, userID, size, app)
 }
 
-// The objects being committed are excluded from the reservation sum: their
-// size is already in sizeDelta.
-func (c *UsageController) CanCommitDriveObjects(ctx context.Context, userID int64, sizeDelta int64, objectKeys []string) error {
-	return c.canUploadFile(ctx, userID, &sizeDelta, ente.Drive, &driveQuota{excludedKeys: objectKeys})
+// The excluded objects aren't counted as reservations: the caller adds their
+// size to sizeDelta.
+func (c *UsageController) CanCommitDriveObjects(ctx context.Context, userID int64, sizeDelta int64, excludedKeys []string) error {
+	return c.canUploadDriveFile(ctx, userID, &sizeDelta, excludedKeys)
+}
+
+func (c *UsageController) canUploadDriveFile(ctx context.Context, userID int64, size *int64, excludedKeys []string) error {
+	plan, err := c.loadQuotaPlan(ctx, userID)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	usage, err := c.UsageRepo.GetUsageWithDriveReservations(ctx, nil, time.Microseconds(), plan.userIDs, userID, excludedKeys)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	return c.checkSubscriptionQuota(ctx, &plan, userID, size, usage.Combined, driveQuotaReads(usage))
 }
 
 // insert runs in the transaction holding the quota lock, so concurrent upload
 // starts for the same subscription can't both fit into the same free space.
-func (c *UsageController) ReserveDriveUpload(ctx context.Context, userID int64, size int64, insert func(tx *sql.Tx) error) error {
-	quota := &driveQuota{reserve: true}
-	defer func() {
-		if quota.tx != nil {
-			_ = quota.tx.Rollback()
+func (c *UsageController) ReserveDriveUpload(ctx context.Context, userID int64, size int64, insert func(ctx context.Context, tx *sql.Tx) error) error {
+	plan, err := c.loadQuotaPlan(ctx, userID)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	// Nothing may take a second pooled connection while holding the quota lock:
+	// once every connection waits for the lock, the holder would wait forever.
+	if plan.bonus == nil {
+		if plan.bonus, err = c.UserCacheCtrl.GetActiveStorageBonus(ctx, plan.adminID); err != nil {
+			return stacktrace.Propagate(err, "failed to get storage bonus")
 		}
-	}()
-	if err := c.canUploadFile(ctx, userID, &size, ente.Drive, quota); err != nil {
-		return stacktrace.Propagate(err, "")
 	}
-	if quota.tx == nil {
-		return stacktrace.NewError("quota check did not lock the subscription")
+	ctx, cancel := context.WithTimeout(ctx, driveReservationTimeout)
+	defer cancel()
+	select {
+	case driveReservationSlots <- struct{}{}:
+		defer func() { <-driveReservationSlots }()
+	case <-ctx.Done():
+		return stacktrace.Propagate(ente.ErrQuotaCheckBusy, "no free reservation slot")
 	}
-	if err := insert(quota.tx); err != nil {
-		return stacktrace.Propagate(err, "")
+	err = c.reserveDriveUploadTx(ctx, &plan, userID, size, insert)
+	if err != nil && !errors.Is(err, ente.ErrStorageLimitExceeded) &&
+		(errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, repo.ErrQuotaLockTimeout)) {
+		return stacktrace.Propagate(ente.ErrQuotaCheckBusy, "%v", err)
 	}
-	return stacktrace.Propagate(quota.tx.Commit(), "")
+	return stacktrace.Propagate(err, "")
 }
 
-func (c *UsageController) readDriveUsage(ctx context.Context, quota *driveQuota, subscriptionAdminID int64, subscriptionUserIDs []int64, userID int64) (int64, int64, error) {
-	if quota.reserve {
-		tx, err := c.UsageRepo.DB.BeginTx(ctx, nil)
-		if err != nil {
-			return 0, 0, stacktrace.Propagate(err, "")
-		}
-		quota.tx = tx
-		if err := c.UsageRepo.LockQuota(ctx, tx, subscriptionAdminID); err != nil {
-			return 0, 0, stacktrace.Propagate(err, "")
-		}
+func (c *UsageController) reserveDriveUploadTx(ctx context.Context, plan *quotaPlan, userID int64, size int64, insert func(ctx context.Context, tx *sql.Tx) error) error {
+	tx, err := c.UsageRepo.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
 	}
-	return c.UsageRepo.GetUsageWithDriveReservations(ctx, quota.tx, time.Microseconds(), subscriptionUserIDs, userID, quota.excludedKeys)
+	defer tx.Rollback()
+	if err := c.UsageRepo.LockQuota(ctx, tx, plan.adminID, driveReservationTimeout); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	usage, err := c.UsageRepo.GetUsageWithDriveReservations(ctx, tx, time.Microseconds(), plan.userIDs, userID, nil)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if err := c.checkSubscriptionQuota(ctx, plan, userID, &size, usage.Combined, driveQuotaReads(usage)); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if err := insert(ctx, tx); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	return stacktrace.Propagate(tx.Commit(), "")
 }
 
 func (c *UsageController) checkAndUpdateCache(ctx context.Context, userID int64, size *int64, app ente.App) error {
-	err := c.canUploadFile(ctx, userID, size, app, nil)
+	err := c.canUploadFile(ctx, userID, size, app)
 	c.mu.Lock()
 	c.UploadResultCache[userID] = err == nil
 	c.mu.Unlock()
 	return err
 }
 
-func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size *int64, app ente.App, drive *driveQuota) error {
-	familyAdminID, err := c.UserRepo.GetFamilyAdminID(userID)
+type quotaPlan struct {
+	adminID     int64
+	userIDs     []int64
+	memberLimit *int64
+	subStorage  int64
+	bonus       *bonus.ActiveStorageBonus
+}
+
+// Read lazily, so the non-Drive check keeps its query sequence.
+type quotaReads struct {
+	lockerUsage func() (int64, error)
+	memberUsage func() (int64, error)
+}
+
+func driveQuotaReads(usage repo.DriveUsage) quotaReads {
+	return quotaReads{
+		lockerUsage: func() (int64, error) { return usage.Locker, nil },
+		memberUsage: func() (int64, error) { return usage.Member, nil },
+	}
+}
+
+func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size *int64, app ente.App) error {
+	plan, err := c.loadQuotaPlan(ctx, userID)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	var subscriptionAdminID int64
-	var subscriptionUserIDs []int64
+	if app == ente.Locker {
+		return c.checkLockerLimits(ctx, &plan, size)
+	}
+	usage, err := c.UsageRepo.GetCombinedUsage(ctx, plan.userIDs)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	return c.checkSubscriptionQuota(ctx, &plan, userID, size, usage, quotaReads{
+		lockerUsage: func() (int64, error) {
+			lockerUsage, err := c.UsageRepo.GetLockerUsage(ctx, plan.userIDs)
+			if err != nil {
+				return 0, err
+			}
+			return lockerUsage.TotalUsage, nil
+		},
+		memberUsage: func() (int64, error) { return c.UsageRepo.GetUsage(userID) },
+	})
+}
 
-	var memberStorageLimit *int64
+func (c *UsageController) loadQuotaPlan(ctx context.Context, userID int64) (quotaPlan, error) {
+	var plan quotaPlan
+	familyAdminID, err := c.UserRepo.GetFamilyAdminID(userID)
+	if err != nil {
+		return plan, stacktrace.Propagate(err, "")
+	}
 	if familyAdminID != nil {
 		familyMembers, err := c.FamilyRepo.GetMembersWithStatus(*familyAdminID, repo.ActiveFamilyMemberStatus)
 		if err != nil {
-			return stacktrace.Propagate(err, "failed to fetch family members")
+			return plan, stacktrace.Propagate(err, "failed to fetch family members")
 		}
-		subscriptionAdminID = *familyAdminID
+		plan.adminID = *familyAdminID
 		for _, familyMember := range familyMembers {
-			subscriptionUserIDs = append(subscriptionUserIDs, familyMember.MemberUserID)
+			plan.userIDs = append(plan.userIDs, familyMember.MemberUserID)
 			if familyMember.MemberUserID == userID && familyMember.MemberUserID != *familyAdminID {
-				memberStorageLimit = familyMember.StorageLimit
+				plan.memberLimit = familyMember.StorageLimit
 			}
 		}
 	} else {
-		subscriptionAdminID = userID
-		subscriptionUserIDs = []int64{userID}
+		plan.adminID = userID
+		plan.userIDs = []int64{userID}
 	}
 
-	var subStorage int64
-	var bonus *bonus.ActiveStorageBonus
-	sub, err := c.BillingCtrl.GetActiveSubscription(subscriptionAdminID)
+	sub, err := c.BillingCtrl.GetActiveSubscription(plan.adminID)
 	if err != nil {
-		subStorage = 0
 		if errors.Is(err, ente.ErrNoActiveSubscription) {
-			bonusRes, bonErr := c.UserCacheCtrl.GetActiveStorageBonus(ctx, subscriptionAdminID)
+			bonusRes, bonErr := c.UserCacheCtrl.GetActiveStorageBonus(ctx, plan.adminID)
 			if bonErr != nil {
-				return stacktrace.Propagate(bonErr, "failed to get bonus data")
+				return plan, stacktrace.Propagate(bonErr, "failed to get bonus data")
 			}
 			if bonusRes.GetMaxExpiry() <= 0 {
-				return stacktrace.Propagate(err, "all bonus & plan expired")
+				return plan, stacktrace.Propagate(err, "all bonus & plan expired")
 			}
-			bonus = bonusRes
+			plan.bonus = bonusRes
 		} else {
-			return stacktrace.Propagate(err, "")
+			return plan, stacktrace.Propagate(err, "")
 		}
 	} else {
-		subStorage = sub.Storage
+		plan.subStorage = sub.Storage
 	}
-	var lockerUsage *repo.LockerUsage
-	var lUsageErr error
-	if app == ente.Locker {
-		lockerUsage, lUsageErr = c.UsageRepo.GetLockerUsage(ctx, subscriptionUserIDs)
-		if lUsageErr != nil {
-			return stacktrace.Propagate(lUsageErr, "failed to fetch locker usage")
-		}
+	return plan, nil
+}
 
-		isPaidUser := false
-		if err := c.BillingCtrl.HasActiveSelfOrFamilySubscription(subscriptionAdminID, true); err == nil {
-			isPaidUser = true
-		}
-
-		limits := GetLockerLimitsForTier(isPaidUser)
-
-		if lockerUsage.TotalFileCount >= limits.FileLimit {
-			return stacktrace.Propagate(&ente.ErrFileLimitReached, "")
-		}
-
-		projectedLockerUsage := lockerUsage.TotalUsage
-		if size != nil {
-			projectedLockerUsage += *size
-		}
-		if projectedLockerUsage >= limits.StorageLimit {
-			return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "locker storage limit exceeded (limit %d, usage %d)", limits.StorageLimit, projectedLockerUsage)
-		}
-		// Locker uploads should not be blocked by Photos subscription limits.
-		return nil
-	}
-
-	var usage, memberUsage int64
-	if drive != nil {
-		usage, memberUsage, err = c.readDriveUsage(ctx, drive, subscriptionAdminID, subscriptionUserIDs, userID)
-	} else {
-		usage, err = c.UsageRepo.GetCombinedUsage(ctx, subscriptionUserIDs)
-	}
+func (c *UsageController) checkLockerLimits(ctx context.Context, plan *quotaPlan, size *int64) error {
+	lockerUsage, err := c.UsageRepo.GetLockerUsage(ctx, plan.userIDs)
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return stacktrace.Propagate(err, "failed to fetch locker usage")
 	}
+
+	isPaidUser := false
+	if err := c.BillingCtrl.HasActiveSelfOrFamilySubscription(plan.adminID, true); err == nil {
+		isPaidUser = true
+	}
+
+	limits := GetLockerLimitsForTier(isPaidUser)
+
+	if lockerUsage.TotalFileCount >= limits.FileLimit {
+		return stacktrace.Propagate(&ente.ErrFileLimitReached, "")
+	}
+
+	projectedLockerUsage := lockerUsage.TotalUsage
+	if size != nil {
+		projectedLockerUsage += *size
+	}
+	if projectedLockerUsage >= limits.StorageLimit {
+		return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "locker storage limit exceeded (limit %d, usage %d)", limits.StorageLimit, projectedLockerUsage)
+	}
+	// Locker uploads should not be blocked by Photos subscription limits.
+	return nil
+}
+
+func (c *UsageController) checkSubscriptionQuota(ctx context.Context, plan *quotaPlan, userID int64, size *int64, usage int64, reads quotaReads) error {
+	var err error
+	subStorage := plan.subStorage
 	newUsage := usage
 
 	if size != nil {
@@ -222,39 +291,34 @@ func (c *UsageController) canUploadFile(ctx context.Context, userID int64, size 
 		subStorage += StorageOverflowAboveSubscriptionLimit
 	}
 	if newUsage > subStorage {
-		if bonus == nil {
-			bonus, err = c.UserCacheCtrl.GetActiveStorageBonus(ctx, subscriptionAdminID)
+		if plan.bonus == nil {
+			plan.bonus, err = c.UserCacheCtrl.GetActiveStorageBonus(ctx, plan.adminID)
 			if err != nil {
 				return stacktrace.Propagate(err, "failed to get storage bonus")
 			}
 		}
-		var eligibleBonus = bonus.GetUsableBonus(subStorage)
+		var eligibleBonus = plan.bonus.GetUsableBonus(subStorage)
 		if newUsage > (subStorage + eligibleBonus) {
-			if lockerUsage == nil && lUsageErr == nil {
-				lockerUsage, lUsageErr = c.UsageRepo.GetLockerUsage(ctx, subscriptionUserIDs)
-				if lUsageErr != nil {
-					return stacktrace.Propagate(lUsageErr, "failed to fetch locker usage")
-				}
+			lockerUsage, lUsageErr := reads.lockerUsage()
+			if lUsageErr != nil {
+				return stacktrace.Propagate(lUsageErr, "failed to fetch locker usage")
 			}
-			if lockerUsage == nil || (newUsage-lockerUsage.TotalUsage) > (subStorage+eligibleBonus) {
-				return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "subscription Storage Limit Exceeded (limit %d, usage %d, bonus %d) for admin %d", subStorage, usage, eligibleBonus, subscriptionAdminID)
+			if (newUsage - lockerUsage) > (subStorage + eligibleBonus) {
+				return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "subscription Storage Limit Exceeded (limit %d, usage %d, bonus %d) for admin %d", subStorage, usage, eligibleBonus, plan.adminID)
 			}
 		}
 	}
 
-	if subscriptionAdminID != userID && memberStorageLimit != nil {
-		if drive == nil {
-			var memberUsageErr error
-			memberUsage, memberUsageErr = c.UsageRepo.GetUsage(userID)
-			if memberUsageErr != nil {
-				return stacktrace.Propagate(memberUsageErr, "Couldn't get Members Usage")
-			}
+	if plan.adminID != userID && plan.memberLimit != nil {
+		memberUsage, memberUsageErr := reads.memberUsage()
+		if memberUsageErr != nil {
+			return stacktrace.Propagate(memberUsageErr, "Couldn't get Members Usage")
 		}
 		if size != nil {
 			memberUsage += *size
 		}
-		if memberUsage > (*memberStorageLimit + StorageOverflowAboveSubscriptionLimit) {
-			return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "member Storage Limit Exceeded (limit %d, usage %d)", *memberStorageLimit, memberUsage)
+		if memberUsage > (*plan.memberLimit + StorageOverflowAboveSubscriptionLimit) {
+			return stacktrace.Propagate(ente.ErrStorageLimitExceeded, "member Storage Limit Exceeded (limit %d, usage %d)", *plan.memberLimit, memberUsage)
 
 		}
 	}

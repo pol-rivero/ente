@@ -380,24 +380,31 @@ func (c *FileController) Update(ctx context.Context, userID int64, file ente.Fil
 	return response, nil
 }
 
-// Admission is final: when every staged object holds a reservation, its bytes
-// were already checked at upload start, so quota consumed since then can't make
-// a finished upload fail. Partly reserved commits get the full check.
+// Admission is final: a staged object holding a reservation was checked at
+// upload start, so quota consumed since then can't make it fail. It stays in
+// the reservation sum instead of being added to sizeDelta; unreserved objects
+// are checked like any new bytes.
 func (c *FileController) checkDriveCommitQuota(ctx context.Context, userID int64, sizeDelta int64, staged map[string]int64) error {
+	var reserved map[string]bool
 	if len(staged) > 0 {
-		reserved, err := c.ObjectCleanupRepo.HoldsDriveReservations(ctx, userID, staged, time.Microseconds())
+		var err error
+		reserved, err = c.ObjectCleanupRepo.GetDriveReservedKeys(ctx, userID, staged, time.Microseconds())
 		if err != nil {
 			return stacktrace.Propagate(err, "")
 		}
-		if reserved {
+		if len(reserved) == len(staged) {
 			return nil
 		}
 	}
-	keys := make([]string, 0, len(staged))
-	for key := range staged {
-		keys = append(keys, key)
+	unreserved := make([]string, 0, len(staged))
+	for key, size := range staged {
+		if reserved[key] {
+			sizeDelta -= size
+		} else {
+			unreserved = append(unreserved, key)
+		}
 	}
-	return stacktrace.Propagate(c.UsageCtrl.CanCommitDriveObjects(ctx, userID, sizeDelta, keys), "")
+	return stacktrace.Propagate(c.UsageCtrl.CanCommitDriveObjects(ctx, userID, sizeDelta, unreserved), "")
 }
 
 // Not for quota rejections: clients retry those with the same object after upgrading.
@@ -477,7 +484,7 @@ func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID in
 		ContentMD5:    &checksum,
 		Client:        client,
 	}
-	if app == ente.Drive {
+	if app == ente.Drive && !publicUpload {
 		url, err := c.presignObjectURL(object)
 		if err != nil {
 			return ente.UploadURL{}, stacktrace.Propagate(err, "")
@@ -487,6 +494,9 @@ func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID in
 		}
 		return ente.UploadURL{ObjectKey: object.ObjectKey, URL: url}, nil
 	}
+	// Link holders can't release what they reserve, so their uploads never hold
+	// any of the owner's quota; Create checks them in full.
+	object.ReservationReleased = app == ente.Drive
 	if err := c.UsageCtrl.CanUploadFile(ctx, userID, &req.ContentLength, app); err != nil {
 		return ente.UploadURL{}, stacktrace.Propagate(err, "")
 	}
@@ -498,7 +508,7 @@ func (c *FileController) GetUploadURLWithMetadata(ctx context.Context, userID in
 }
 
 func (c *FileController) reserveDriveUpload(ctx context.Context, userID int64, object ente.TempObject) error {
-	return c.UsageCtrl.ReserveDriveUpload(ctx, userID, *object.ContentLength, func(tx *sql.Tx) error {
+	return c.UsageCtrl.ReserveDriveUpload(ctx, userID, *object.ContentLength, func(ctx context.Context, tx *sql.Tx) error {
 		return c.ObjectCleanupCtrl.AddTempObjectTx(ctx, tx, object)
 	})
 }
@@ -807,7 +817,7 @@ func (c *FileController) UpdateThumbnail(ctx *gin.Context, fileID int64, newThum
 	if !strings.HasPrefix(newThumbnail.ObjectKey, objectPathPrefix) {
 		return stacktrace.Propagate(ente.ErrBadRequest, "Incorrect object key reported")
 	}
-	ownerID, err := c.FileRepo.GetOwnerID(fileID)
+	ownerID, fileApp, err := c.FileRepo.GetOwnerIDAndApp(fileID)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -828,8 +838,8 @@ func (c *FileController) UpdateThumbnail(ctx *gin.Context, fileID int64, newThum
 	if diff > 0 {
 		return stacktrace.Propagate(errors.New("new thumbnail larger than existing thumbnail"), "")
 	}
-	if app == ente.Drive {
-		err = c.UsageCtrl.CanCommitDriveObjects(ctx, userID, diff, []string{newThumbnail.ObjectKey})
+	if app == ente.Drive || fileApp == ente.Drive {
+		err = c.checkDriveCommitQuota(ctx, userID, diff, map[string]int64{newThumbnail.ObjectKey: newThumbnailSize})
 	} else {
 		err = c.UsageCtrl.CanUploadFile(ctx, userID, &diff, app)
 	}
@@ -1314,14 +1324,19 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 		Client:        client,
 	}
 	var uploadID string
-	if app == ente.Drive {
+	if app == ente.Drive && !publicUpload {
 		uploadID, err = c.startReservedMultipartUpload(ctx, userID, object)
 		if err != nil {
 			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
 		}
 	} else {
 		// Photos mobile doesn't handle a 426 here, so only Drive passes the size.
-		if err := c.UsageCtrl.CanUploadFile(ctx, userID, nil, app); err != nil {
+		var uploadSize *int64
+		if app == ente.Drive {
+			uploadSize = &req.ContentLength
+			object.ReservationReleased = true
+		}
+		if err := c.UsageCtrl.CanUploadFile(ctx, userID, uploadSize, app); err != nil {
 			return ente.MultipartUploadURLs{}, stacktrace.Propagate(err, "")
 		}
 		r, err := c.S3Config.GetHotS3Client().CreateMultipartUpload(&s3.CreateMultipartUploadInput{
@@ -1362,8 +1377,10 @@ func (c *FileController) GetMultipartUploadURLWithMetadata(ctx context.Context, 
 }
 
 // The quota lock mustn't be held across S3 calls, so the row is committed
-// before CreateMultipartUpload and gets its upload ID afterwards.
+// before CreateMultipartUpload (as a pending row, see SetTempObjectUploadID)
+// and gets its upload ID afterwards.
 func (c *FileController) startReservedMultipartUpload(ctx context.Context, userID int64, object ente.TempObject) (string, error) {
+	object.IsMultipart = false
 	if err := c.reserveDriveUpload(ctx, userID, object); err != nil {
 		return "", stacktrace.Propagate(err, "")
 	}
@@ -1371,20 +1388,31 @@ func (c *FileController) startReservedMultipartUpload(ctx context.Context, userI
 		Bucket: c.S3Config.GetHotBucket(),
 		Key:    &object.ObjectKey,
 	})
-	if err == nil {
-		err = c.ObjectCleanupRepo.SetTempObjectUploadID(context.WithoutCancel(ctx), object.ObjectKey, *r.UploadId)
-	}
 	if err != nil {
 		// The cleanup cron aborts any upload S3 created despite the error.
-		if expireErr := c.ObjectCleanupRepo.ExpireTempObjectNow(context.WithoutCancel(ctx), object.ObjectKey, userID); expireErr != nil {
-			log.WithError(expireErr).WithFields(log.Fields{
-				"user_id":    userID,
-				"object_key": object.ObjectKey,
-			}).Error("Failed to release the reservation of a failed multipart upload start")
+		c.releaseFailedUploadStart(ctx, userID, object.ObjectKey)
+		return "", stacktrace.Propagate(err, "")
+	}
+	uploadID := *r.UploadId
+	if err := c.ObjectCleanupRepo.SetTempObjectUploadID(context.WithoutCancel(ctx), object.ObjectKey, uploadID, time.Microseconds()); err != nil {
+		c.releaseFailedUploadStart(ctx, userID, object.ObjectKey)
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartUploadStorageTimeout)
+		defer cancel()
+		if abortErr := c.ObjectCleanupCtrl.abortMultipartUploadWithContext(abortCtx, object.ObjectKey, uploadID, object.BucketId); abortErr != nil {
+			log.WithError(abortErr).WithField("object_key", object.ObjectKey).Warn("Failed to abort multipart upload, leaving it to the cleanup cron")
 		}
 		return "", stacktrace.Propagate(err, "")
 	}
-	return *r.UploadId, nil
+	return uploadID, nil
+}
+
+func (c *FileController) releaseFailedUploadStart(ctx context.Context, userID int64, objectKey string) {
+	if err := c.ObjectCleanupRepo.ExpireTempObjectNow(context.WithoutCancel(ctx), objectKey, userID); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"user_id":    userID,
+			"object_key": objectKey,
+		}).Error("Failed to release the reservation of a failed multipart upload start")
+	}
 }
 
 func (c *FileController) getPartURL(dc string, objectKey string, partNumber int64, uploadID *string, contentLength *int64, contentMD5 *string) (string, error) {

@@ -144,13 +144,14 @@ func (c *ObjectCleanupController) removeUnreportedObject(tx *sql.Tx, t ente.Temp
 		return skip(stacktrace.Propagate(err, ""))
 	}
 
-	if t.IsMultipart && t.UploadID == "" {
-		err = c.abortMultipartUploadsForKey(t.ObjectKey, dc)
+	switch {
+	case t.IsMultipart && t.UploadID != "":
+		err = c.abortMultipartUpload(t.ObjectKey, t.UploadID, dc)
 		if err != nil {
 			return skip(err)
 		}
-	} else if t.IsMultipart {
-		err = c.abortMultipartUpload(t.ObjectKey, t.UploadID, dc)
+	case t.IsMultipart || t.PartLength != nil:
+		err = c.abortMultipartUploadsForKey(t.ObjectKey, dc)
 		if err != nil {
 			return skip(err)
 		}
@@ -273,8 +274,9 @@ func (c *ObjectCleanupController) disableConditionalHoldIfPresent(dc string, obj
 	return nil
 }
 
-// Drive rows get their upload ID only after CreateMultipartUpload returns, so
-// a crash or a failed start leaves the row without one.
+// Reserved Drive multipart starts store their upload ID only after
+// CreateMultipartUpload returns, so a crash, a failed start or a cancel before
+// then leaves the row without one.
 func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, dc string) error {
 	s3Client := c.S3Config.GetS3Client(dc)
 	var keyMarker, uploadIDMarker *string
@@ -300,16 +302,21 @@ func (c *ObjectCleanupController) abortMultipartUploadsForKey(objectKey string, 
 		if !aws.BoolValue(output.IsTruncated) {
 			return nil
 		}
-		nextKey, nextUploadID := output.NextKeyMarker, output.NextUploadIdMarker
+		nextKey, nextUploadID := aws.StringValue(output.NextKeyMarker), aws.StringValue(output.NextUploadIdMarker)
 		// Some S3-compatible stores omit the next markers.
-		if aws.StringValue(nextKey) == "" && len(output.Uploads) > 0 {
+		if len(output.Uploads) > 0 {
 			last := output.Uploads[len(output.Uploads)-1]
-			nextKey, nextUploadID = last.Key, last.UploadId
+			if nextKey == "" {
+				nextKey = aws.StringValue(last.Key)
+			}
+			if nextUploadID == "" {
+				nextUploadID = aws.StringValue(last.UploadId)
+			}
 		}
-		if aws.StringValue(nextKey) == aws.StringValue(keyMarker) && aws.StringValue(nextUploadID) == aws.StringValue(uploadIDMarker) {
+		if nextKey == "" || (nextKey == aws.StringValue(keyMarker) && nextUploadID == aws.StringValue(uploadIDMarker)) {
 			return stacktrace.NewError("truncated multipart upload listing did not advance")
 		}
-		keyMarker, uploadIDMarker = nextKey, nextUploadID
+		keyMarker, uploadIDMarker = aws.String(nextKey), aws.String(nextUploadID)
 	}
 }
 

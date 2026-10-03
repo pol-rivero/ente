@@ -208,17 +208,18 @@ type ObjectState struct {
 }
 
 type TempObject struct {
-	ObjectKey     string
-	IsMultipart   bool
-	UploadID      string
-	BucketId      string
-	UserID        int64
-	App           App
-	Purpose       string
-	ContentLength *int64
-	ContentMD5    *string
-	PartLength    *int64
-	Client        string
+	ObjectKey           string
+	IsMultipart         bool
+	UploadID            string
+	BucketId            string
+	UserID              int64
+	App                 App
+	Purpose             string
+	ContentLength       *int64
+	ContentMD5          *string
+	PartLength          *int64
+	Client              string
+	ReservationReleased bool
 }
 
 type DuplicateFiles struct {

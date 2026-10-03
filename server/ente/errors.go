@@ -248,6 +248,12 @@ var ErrUploadBusy = &ApiError{
 	HttpStatusCode: http.StatusConflict,
 }
 
+var ErrQuotaCheckBusy = &ApiError{
+	Code:           QuotaCheckBusy,
+	Message:        "Too many uploads are being started, retry shortly",
+	HttpStatusCode: http.StatusServiceUnavailable,
+}
+
 var ErrLockerRegistrationDisabled = &ApiError{
 	Code:           LockerRegistrationDisabled,
 	Message:        "Locker is restricted to paid users currently",
@@ -306,6 +312,8 @@ const (
 	UploadGone ErrorCode = "UPLOAD_GONE"
 
 	UploadBusy ErrorCode = "UPLOAD_BUSY"
+
+	QuotaCheckBusy ErrorCode = "QUOTA_CHECK_BUSY"
 
 	SessionExpired ErrorCode = "SESSION_EXPIRED"
 
