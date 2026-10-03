@@ -34,6 +34,27 @@ type Collection struct {
 	ParentKeyNonce      *string        `json:"parentKeyNonce,omitempty"`
 }
 
+// A top-level folder has depth 1.
+const MaxCollectionDepth = 64
+
+type MoveCollectionRequest struct {
+	CollectionID       int64         `json:"collectionID" binding:"required"`
+	NewParentID        NullableInt64 `json:"newParentID"`
+	ParentEncryptedKey *string       `json:"parentEncryptedKey"`
+	ParentKeyNonce     *string       `json:"parentKeyNonce"`
+}
+
+// Tells an explicit null (Present, Value nil) apart from an absent key.
+type NullableInt64 struct {
+	Present bool
+	Value   *int64
+}
+
+func (n *NullableInt64) UnmarshalJSON(data []byte) error {
+	n.Present = true
+	return json.Unmarshal(data, &n.Value)
+}
+
 // Only the owner may see the folder tree.
 func (c *Collection) ClearParent() {
 	c.ParentID = nil

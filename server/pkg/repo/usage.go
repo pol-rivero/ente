@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/ente/stacktrace"
@@ -79,15 +78,9 @@ func (repo *UsageRepository) GetCombinedUsage(ctx context.Context, userIDs []int
 	return totalUsage, stacktrace.Propagate(err, "")
 }
 
-// lock_timeout backs up the caller's context deadline: a waiter holds a pooled
-// connection until it gets the lock.
 func (repo *UsageRepository) LockQuota(ctx context.Context, tx *sql.Tx, subscriptionAdminID int64, timeout time.Duration) error {
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`SET LOCAL lock_timeout = %d`, timeout.Milliseconds())); err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1::bigint, 0))`, subscriptionAdminID)
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "55P03" {
+	err := lockAdvisoryXact(ctx, tx, "quota", subscriptionAdminID, timeout)
+	if isLockTimeout(err) {
 		return stacktrace.Propagate(ErrQuotaLockTimeout, "%v", err)
 	}
 	return stacktrace.Propagate(err, "")

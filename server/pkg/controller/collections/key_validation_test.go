@@ -113,7 +113,7 @@ func TestCollectionControllerRejectsInvalidCollectionKeysBeforeRepoAccess(t *tes
 	controller := CollectionController{}
 	ctx := testGinContext()
 
-	if _, err := controller.Create(ente.Collection{
+	if _, err := controller.Create(ctx, ente.Collection{
 		EncryptedKey:       b64OfLen(encryptedCollectionKeyLen + 1),
 		KeyDecryptionNonce: b64OfLen(secretboxNonceBytes),
 		Type:               "album",

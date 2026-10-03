@@ -44,7 +44,16 @@ type CollectionShareItem struct {
 }
 
 func (repo *CollectionRepository) Create(c ente.Collection) (ente.Collection, error) {
+	return insertCollection(context.Background(), repo.DB, c)
+}
 
+func (repo *CollectionRepository) CreateTx(ctx context.Context, tx *sql.Tx, c ente.Collection) (ente.Collection, error) {
+	return insertCollection(ctx, tx, c)
+}
+
+func insertCollection(ctx context.Context, db interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, c ente.Collection) (ente.Collection, error) {
 	if !ente.App(c.App).IsValidForCollection() {
 		return ente.Collection{}, ente.ErrInvalidApp
 	}
@@ -52,7 +61,7 @@ func (repo *CollectionRepository) Create(c ente.Collection) (ente.Collection, er
 	if c.ParentID == nil {
 		c.ClearParent()
 	}
-	err := repo.DB.QueryRow(`INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, magic_metadata, pub_magic_metadata, app, parent_id, parent_encrypted_key, parent_key_nonce) 
+	err := db.QueryRowContext(ctx, `INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, encrypted_name, name_decryption_nonce, type, attributes, updation_time, magic_metadata, pub_magic_metadata, app, parent_id, parent_encrypted_key, parent_key_nonce) 
         VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING collection_id`,
 		c.Owner.ID, c.EncryptedKey, c.KeyDecryptionNonce, c.Name, c.EncryptedName, c.NameDecryptionNonce, c.Type, c.Attributes, c.UpdationTime, c.MagicMetadata, c.PublicMagicMetadata, c.App, c.ParentID, c.ParentEncryptedKey, c.ParentKeyNonce).Scan(&c.ID)
 	if err != nil {

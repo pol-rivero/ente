@@ -254,6 +254,36 @@ var ErrQuotaCheckBusy = &ApiError{
 	HttpStatusCode: http.StatusServiceUnavailable,
 }
 
+var ErrInvalidParent = &ApiError{
+	Code:           InvalidParent,
+	Message:        "The parent folder doesn't exist or can't contain this collection",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
+var ErrCollectionCycle = &ApiError{
+	Code:           CollectionCycle,
+	Message:        "A folder can't be moved into itself or one of its subfolders",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
+var ErrMaxDepthExceeded = &ApiError{
+	Code:           MaxDepthExceeded,
+	Message:        fmt.Sprintf("Folders can't be nested more than %d levels deep", MaxCollectionDepth),
+	HttpStatusCode: http.StatusBadRequest,
+}
+
+var ErrInvalidCollection = &ApiError{
+	Code:           InvalidCollection,
+	Message:        "Only Drive folders can be moved",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
+var ErrCollectionTreeBusy = &ApiError{
+	Code:           CollectionTreeBusy,
+	Message:        "Another folder change is in progress, retry shortly",
+	HttpStatusCode: http.StatusServiceUnavailable,
+}
+
 var ErrCopyReservationLost = &ApiError{
 	Code:           CopyReservationLost,
 	Message:        "The storage reserved for the copy is no longer held",
@@ -332,6 +362,12 @@ const (
 	UploadBusy ErrorCode = "UPLOAD_BUSY"
 
 	QuotaCheckBusy ErrorCode = "QUOTA_CHECK_BUSY"
+
+	InvalidParent      ErrorCode = "INVALID_PARENT"
+	CollectionCycle    ErrorCode = "COLLECTION_CYCLE"
+	MaxDepthExceeded   ErrorCode = "MAX_DEPTH_EXCEEDED"
+	InvalidCollection  ErrorCode = "INVALID_COLLECTION"
+	CollectionTreeBusy ErrorCode = "COLLECTION_TREE_BUSY"
 
 	PermissionDenied     ErrorCode = "PERMISSION_DENIED"
 	StorageLimitExceeded ErrorCode = "STORAGE_LIMIT_EXCEEDED"

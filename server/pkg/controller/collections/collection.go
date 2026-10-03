@@ -43,7 +43,7 @@ type CollectionController struct {
 	ReactionsRepo         *socialrepo.ReactionsRepository
 }
 
-func (c *CollectionController) Create(collection ente.Collection, ownerID int64) (ente.Collection, error) {
+func (c *CollectionController) Create(ctx context.Context, collection ente.Collection, ownerID int64) (ente.Collection, error) {
 	if err := validateOwnedCollectionKey(collection.EncryptedKey, collection.KeyDecryptionNonce); err != nil {
 		return ente.Collection{}, err
 	}
@@ -51,8 +51,11 @@ func (c *CollectionController) Create(collection ente.Collection, ownerID int64)
 	if _, keyErr := c.UserRepo.GetKeyAttributes(ownerID); keyErr != nil {
 		return ente.Collection{}, stacktrace.Propagate(keyErr, "Unable to get keyAttributes")
 	}
-	// Parent fields are ignored until create-with-parent validation exists.
-	collection.ClearParent()
+	isDrive := collection.App == string(ente.Drive)
+	if !isDrive {
+		// Other apps have always ignored these fields.
+		collection.ClearParent()
+	}
 	collectionType := collection.Type
 	app := collection.App
 	collection.Owner.ID = ownerID
@@ -64,6 +67,14 @@ func (c *CollectionController) Create(collection ente.Collection, ownerID int64)
 	}
 	if !slices.Contains(ente.ValidCollectionTypes, collection.Type) {
 		return ente.Collection{}, stacktrace.Propagate(fmt.Errorf("unexpected collection type %s", collection.Type), "")
+	}
+	if isDrive {
+		if err := validateParentFields(collection.ParentID, collection.ParentEncryptedKey, collection.ParentKeyNonce); err != nil {
+			return ente.Collection{}, stacktrace.Propagate(err, "")
+		}
+		if collection.ParentID != nil {
+			return c.createWithParent(ctx, collection)
+		}
 	}
 	collection, err := c.CollectionRepo.Create(collection)
 	if err != nil {

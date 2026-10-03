@@ -29,7 +29,7 @@ func (h *CollectionHandler) Create(c *gin.Context) {
 
 	collection.App = string(auth.GetApp(c))
 	collection.UpdationTime = time.Microseconds()
-	collection, err := h.Controller.Create(collection,
+	collection, err := h.Controller.Create(c.Request.Context(), collection,
 		auth.GetUserID(c.Request.Header))
 	if err != nil {
 		handler.Error(c, stacktrace.Propagate(err, "Could not create collection"))
@@ -452,6 +452,19 @@ func (h *CollectionHandler) Rename(c *gin.Context) {
 		return
 	}
 	if err := h.Controller.Rename(auth.GetUserID(c.Request.Header), request.CollectionID, request.EncryptedName, request.NameDecryptionNonce); err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	c.Status(http.StatusOK)
+}
+
+func (h *CollectionHandler) MoveCollection(c *gin.Context) {
+	var request ente.MoveCollectionRequest
+	if err := handler.BindJSON(c, &request); err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	if err := h.Controller.MoveCollection(c.Request.Context(), auth.GetUserID(c.Request.Header), request); err != nil {
 		handler.Error(c, stacktrace.Propagate(err, ""))
 		return
 	}

@@ -83,14 +83,19 @@ func setupCollectionResponseFixture(t *testing.T) *collectionResponseFixture {
 	}
 }
 
-func (f *collectionResponseFixture) request(t *testing.T, method, path string, userID int64, clientPackage, body string) []byte {
-	t.Helper()
+func (f *collectionResponseFixture) do(method, path string, userID int64, clientPackage, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Auth-User-ID", fmt.Sprint(userID))
 	req.Header.Set("X-Client-Package", clientPackage)
 	recorder := httptest.NewRecorder()
 	f.router.ServeHTTP(recorder, req)
+	return recorder
+}
+
+func (f *collectionResponseFixture) request(t *testing.T, method, path string, userID int64, clientPackage, body string) []byte {
+	t.Helper()
+	recorder := f.do(method, path, userID, clientPackage, body)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	return recorder.Body.Bytes()
 }
@@ -249,21 +254,86 @@ func TestParentFieldsAreOwnerOnly(t *testing.T) {
 	require.NotContains(t, rootOwnerResponse, "parent")
 }
 
-func TestCreateIgnoresClientParentFields(t *testing.T) {
+func createBody(collectionType, parentFields string) string {
+	return fmt.Sprintf(`{"encryptedKey":%q,"keyDecryptionNonce":%q,"encryptedName":"name","nameDecryptionNonce":"nonce","type":%q%s}`,
+		base64.StdEncoding.EncodeToString(make([]byte, 48)), base64.StdEncoding.EncodeToString(make([]byte, 24)), collectionType, parentFields)
+}
+
+func TestNonDriveCreateIgnoresClientParentFields(t *testing.T) {
 	f := setupCollectionResponseFixture(t)
 	rootID := f.createDriveFolder(t, nil)
-	body := fmt.Sprintf(`{"encryptedKey":%q,"keyDecryptionNonce":%q,"encryptedName":"name","nameDecryptionNonce":"nonce",
-		"type":"folder","parentID":%d,"parentEncryptedKey":"parent-key","parentKeyNonce":"parent-nonce"}`,
-		base64.StdEncoding.EncodeToString(make([]byte, 48)), base64.StdEncoding.EncodeToString(make([]byte, 24)), rootID)
-	response := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, "io.ente.drive", body)
-	require.NotContains(t, string(response), "parent")
+	normalize := regexp.MustCompile(`"(id|updationTime)":\d+`)
+	for _, clientPackage := range []string{"io.ente.photos", "io.ente.locker"} {
+		for _, collectionType := range []string{"album", "folder"} {
+			plain := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, clientPackage, createBody(collectionType, ""))
+			withParent := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, clientPackage, createBody(collectionType,
+				fmt.Sprintf(`,"parentID":%d,"parentEncryptedKey":"parent-key","parentKeyNonce":"parent-nonce"`, rootID)))
+			require.Equal(t, string(normalize.ReplaceAll(plain, nil)), string(normalize.ReplaceAll(withParent, nil)))
+		}
+	}
+	var withParentColumns int
+	require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM collections
+		WHERE parent_id IS NOT NULL OR parent_encrypted_key IS NOT NULL OR parent_key_nonce IS NOT NULL`).Scan(&withParentColumns))
+	require.Zero(t, withParentColumns)
+}
+
+func TestDriveCreateAndMoveWithParent(t *testing.T) {
+	f := setupCollectionResponseFixture(t)
+	f.router.POST("/collections/move-collection", (&CollectionHandler{Controller: &collections.CollectionController{
+		CollectionRepo: f.collectionRepo,
+	}}).MoveCollection)
+	rootID, otherRootID := f.createDriveFolder(t, nil), f.createDriveFolder(t, nil)
+	parentKey, parentNonce := base64.StdEncoding.EncodeToString(make([]byte, 48)), base64.StdEncoding.EncodeToString(make([]byte, 24))
+	parentFields := fmt.Sprintf(`"parentEncryptedKey":%q,"parentKeyNonce":%q`, parentKey, parentNonce)
+
+	response := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, "io.ente.drive",
+		createBody("folder", fmt.Sprintf(`,"parentID":%d,%s`, rootID, parentFields)))
+	require.Contains(t, string(response), fmt.Sprintf(`"parentID":%d,%s`, rootID, parentFields))
 	var created struct {
 		Collection ente.Collection `json:"collection"`
 	}
 	require.NoError(t, json.Unmarshal(response, &created))
-	require.Equal(t, string(ente.Drive), created.Collection.App)
-	var hasParentColumns bool
-	require.NoError(t, f.db.QueryRow(`SELECT parent_id IS NOT NULL OR parent_encrypted_key IS NOT NULL OR parent_key_nonce IS NOT NULL
-		FROM collections WHERE collection_id = $1`, created.Collection.ID).Scan(&hasParentColumns))
-	require.False(t, hasParentColumns)
+	childID := created.Collection.ID
+	f.shareAndLink(t, childID, "DRIVELINK")
+
+	recorder := f.do(http.MethodPost, "/collections", parentTestOwnerID, "io.ente.drive",
+		createBody("folder", fmt.Sprintf(`,"parentID":%d,%s`, int64(1_000_000), parentFields)))
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"code":"INVALID_PARENT"`)
+
+	var sinceTime int64
+	require.NoError(t, f.db.QueryRow(`SELECT max(updation_time) FROM collections`).Scan(&sinceTime))
+	recorder = f.do(http.MethodPost, "/collections/move-collection", parentTestOwnerID, "io.ente.drive",
+		fmt.Sprintf(`{"collectionID":%d,"newParentID":%d,%s}`, childID, otherRootID, parentFields))
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	require.Empty(t, recorder.Body.String())
+
+	ownerDiff := syncedCollectionsByID(t, f.request(t, http.MethodGet, fmt.Sprintf("/collections/v2?sinceTime=%d", sinceTime),
+		parentTestOwnerID, "io.ente.drive", ""), "collections")
+	require.Len(t, ownerDiff, 1)
+	require.Contains(t, ownerDiff[childID], fmt.Sprintf(`"parentID":%d,%s`, otherRootID, parentFields))
+	for name, body := range f.responses(t, childID, "io.ente.drive") {
+		if !strings.HasPrefix(name, "owner") {
+			require.NotContains(t, body, "parent", name)
+		}
+	}
+
+	recorder = f.do(http.MethodPost, "/collections/move-collection", parentTestOwnerID, "io.ente.drive",
+		fmt.Sprintf(`{"collectionID":%d,"newParentID":%d,%s}`, otherRootID, childID, parentFields))
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"code":"COLLECTION_CYCLE"`)
+
+	recorder = f.do(http.MethodPost, "/collections/move-collection", parentTestOwnerID, "io.ente.drive",
+		fmt.Sprintf(`{"collectionID":%d}`, childID))
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"code":"BAD_REQUEST"`)
+	var storedParent int64
+	require.NoError(t, f.db.QueryRow(`SELECT parent_id FROM collections WHERE collection_id = $1`, childID).Scan(&storedParent))
+	require.Equal(t, otherRootID, storedParent)
+
+	recorder = f.do(http.MethodPost, "/collections/move-collection", parentTestOwnerID, "io.ente.drive",
+		fmt.Sprintf(`{"collectionID":%d,"newParentID":null}`, childID))
+	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	ownerView := string(f.request(t, http.MethodGet, fmt.Sprintf("/collections/%d", childID), parentTestOwnerID, "io.ente.drive", ""))
+	require.NotContains(t, ownerView, "parent")
 }

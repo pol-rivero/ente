@@ -784,6 +784,7 @@ func main() {
 	storageAPI.GET("/collections/sharees", collectionHandler.GetSharees)
 	storageAPI.DELETE("/collections/v3/:collectionID", collectionHandler.TrashV3)
 	storageAPI.POST("/collections/rename", collectionHandler.Rename)
+	storageAPI.POST("/collections/move-collection", collectionHandler.MoveCollection)
 	storageAPI.PUT("/collections/magic-metadata", collectionHandler.PrivateMagicMetadataUpdate)
 	storageAPI.PUT("/collections/public-magic-metadata", collectionHandler.PublicMagicMetadataUpdate)
 	storageAPI.PUT("/collections/sharee-magic-metadata", collectionHandler.ShareeMagicMetadataUpdate)

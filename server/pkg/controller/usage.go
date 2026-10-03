@@ -121,12 +121,11 @@ func (c *UsageController) ReserveDriveUpload(ctx context.Context, userID int64, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, driveReservationTimeout)
 	defer cancel()
-	select {
-	case driveReservationSlots <- struct{}{}:
-		defer func() { <-driveReservationSlots }()
-	case <-ctx.Done():
+	release, ok := AcquireSlot(ctx, driveReservationSlots)
+	if !ok {
 		return stacktrace.Propagate(ente.ErrQuotaCheckBusy, "no free reservation slot")
 	}
+	defer release()
 	err = c.reserveDriveUploadTx(ctx, &plan, userID, size, insert)
 	if err != nil && !errors.Is(err, ente.ErrStorageLimitExceeded) &&
 		(errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, repo.ErrQuotaLockTimeout)) {
