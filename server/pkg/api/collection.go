@@ -445,6 +445,24 @@ func (h *CollectionHandler) TrashV3(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
+func (h *CollectionHandler) TrashV4(c *gin.Context) {
+	cID, err := strconv.ParseInt(c.Param("collectionID"), 10, 64)
+	if err != nil {
+		handler.Error(c, stacktrace.Propagate(ente.NewBadRequestWithMessage("collectionID must be an integer"), "%v", err))
+		return
+	}
+	var req ente.TrashCollectionV4Request
+	if err := c.ShouldBindQuery(&req); err != nil {
+		handler.Error(c, stacktrace.Propagate(ente.NewBadRequestWithMessage("keepFiles and recursive are required booleans"), "%v", err))
+		return
+	}
+	if err := h.Controller.TrashV4(c.Request.Context(), auth.GetUserID(c.Request.Header), cID, *req.KeepFiles, *req.Recursive); err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	c.Status(http.StatusOK)
+}
+
 func (h *CollectionHandler) Rename(c *gin.Context) {
 	var request ente.RenameRequest
 	if err := handler.BindJSON(c, &request); err != nil {

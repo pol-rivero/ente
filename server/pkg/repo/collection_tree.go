@@ -23,6 +23,10 @@ func (n *CollectionTreeNode) IsDriveFolder() bool {
 	return n.App == string(ente.Drive) && n.Type == "folder"
 }
 
+func (n *CollectionTreeNode) AllowDelete() bool {
+	return (&ente.Collection{Type: n.Type}).AllowDelete()
+}
+
 func (n *CollectionTreeNode) IsLiveDriveFolderOf(ownerID int64) bool {
 	return n != nil && n.OwnerID == ownerID && n.IsDriveFolder() && !n.IsDeleted
 }
@@ -111,4 +115,46 @@ func (repo *CollectionRepository) SetParentTx(ctx context.Context, tx *sql.Tx, c
 		SET parent_id = $2, parent_encrypted_key = $3, parent_key_nonce = $4, updation_time = $5
 		WHERE collection_id = $1`, collectionID, parentID, parentEncryptedKey, parentKeyNonce, updationTime)
 	return stacktrace.Propagate(err, "")
+}
+
+// Returns at most limit live collections of the subtree, the root included.
+// Live folders below a deleted one aren't part of it: the trash worker
+// re-roots them (ReRootLiveChildrenTx).
+func (repo *CollectionRepository) GetLiveSubtreeIDsTx(ctx context.Context, tx *sql.Tx, collectionID int64, limit int) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE sub(id) AS (
+			SELECT collection_id FROM collections WHERE collection_id = $1 AND NOT is_deleted
+			UNION
+			SELECT c.collection_id
+			FROM collections c JOIN sub s ON c.parent_id = s.id
+			WHERE NOT c.is_deleted)
+		SELECT id FROM sub LIMIT $2`, collectionID, limit)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	return scanInt64s(rows)
+}
+
+// Older binaries could delete a folder without its children.
+func (repo *CollectionRepository) ReRootLiveChildrenTx(ctx context.Context, tx *sql.Tx, parentID int64, updationTime int64) (int64, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE collections
+		SET parent_id = NULL, parent_encrypted_key = NULL, parent_key_nonce = NULL, updation_time = $2
+		WHERE parent_id = $1 AND NOT is_deleted`, parentID, updationTime)
+	if err != nil {
+		return 0, stacktrace.Propagate(err, "")
+	}
+	count, err := result.RowsAffected()
+	return count, stacktrace.Propagate(err, "")
+}
+
+func scanInt64s(rows *sql.Rows) ([]int64, error) {
+	defer rows.Close()
+	values := make([]int64, 0)
+	for rows.Next() {
+		var value int64
+		if err := rows.Scan(&value); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		values = append(values, value)
+	}
+	return values, stacktrace.Propagate(rows.Err(), "")
 }

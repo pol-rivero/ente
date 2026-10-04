@@ -126,13 +126,26 @@ func (c *DeleteUserCleanupController) deleteCollections(ctx context.Context, ite
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	driveCollections, err := c.CollectionRepo.GetLiveDriveCollectionIDSet(ctx, item.UserID)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	driveCollectionIDs := make([]int64, 0, len(driveCollections))
 	for collectionID, isAlreadyDeleted := range collectionsMap {
-		if !isAlreadyDeleted {
-			err = c.CollectionRepo.ScheduleDelete(collectionID)
-			if err != nil {
-				return stacktrace.Propagate(err, "error while deleting collection %d", collectionID)
-			}
+		if isAlreadyDeleted {
+			continue
 		}
+		if driveCollections[collectionID] {
+			driveCollectionIDs = append(driveCollectionIDs, collectionID)
+			continue
+		}
+		err = c.CollectionRepo.ScheduleDelete(collectionID)
+		if err != nil {
+			return stacktrace.Propagate(err, "error while deleting collection %d", collectionID)
+		}
+	}
+	if err := c.CollectionRepo.ScheduleDeletes(ctx, driveCollectionIDs, repo.TrashCollectionDriveQueue); err != nil {
+		return stacktrace.Propagate(err, "error while deleting Drive collections")
 	}
 	/* todo: neeraj : verify that all collection delete request are processed before moving to empty trash stage.
 	 */

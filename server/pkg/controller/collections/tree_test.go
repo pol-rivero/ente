@@ -15,7 +15,10 @@ import (
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/internal/testutil"
 	"github.com/ente/museum/pkg/controller"
+	"github.com/ente/museum/pkg/controller/access"
+	publicCtrl "github.com/ente/museum/pkg/controller/public"
 	"github.com/ente/museum/pkg/repo"
+	castRepo "github.com/ente/museum/pkg/repo/cast"
 	"github.com/ente/museum/pkg/repo/public"
 	"github.com/stretchr/testify/require"
 )
@@ -48,9 +51,19 @@ func setupTreeFixture(t *testing.T) *treeFixture {
 }
 
 func newTreeTestController(db *sql.DB) *CollectionController {
+	linkRepo := public.NewCollectionLinkRepository(db, "")
+	linkRepo.Cache = public.NewLinkCache(gTime.Minute, gTime.Minute)
+	queueRepo := &repo.QueueRepository{DB: db}
+	fileRepo := &repo.FileRepository{DB: db, QueueRepo: queueRepo}
+	collectionRepo := &repo.CollectionRepository{DB: db, CollectionLinkRepo: linkRepo, QueueRepo: queueRepo, FileRepo: fileRepo,
+		TrashRepo: &repo.TrashRepository{DB: db, QueueRepo: queueRepo, FileRepo: fileRepo, FileLinkRepo: public.NewFileLinkRepo(db)}}
 	return &CollectionController{
-		CollectionRepo: &repo.CollectionRepository{DB: db, CollectionLinkRepo: public.NewCollectionLinkRepository(db, "")},
-		UserRepo:       &repo.UserRepository{DB: db},
+		CollectionRepo:     collectionRepo,
+		UserRepo:           &repo.UserRepository{DB: db},
+		AccessCtrl:         access.NewAccessController(collectionRepo, fileRepo),
+		CollectionLinkCtrl: &publicCtrl.CollectionLinkController{CollectionLinkRepo: linkRepo},
+		CastRepo:           &castRepo.Repository{DB: db},
+		QueueRepo:          queueRepo,
 	}
 }
 

@@ -38,7 +38,7 @@ func TestAddFilesUpsertsBatchAndPreservesConflictFields(t *testing.T) {
 		collectionMembershipTestItem(activeFileID),
 		collectionMembershipTestItem(deletedFileID),
 	}
-	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID); err != nil {
+	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID, ente.Photos); err != nil {
 		t.Fatalf("AddFiles() error = %v", err)
 	}
 
@@ -103,7 +103,7 @@ func TestAddFilesSupportsMaximumBatchSize(t *testing.T) {
 		files[index] = collectionMembershipTestItem(fileID)
 	}
 
-	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID); err != nil {
+	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID, ente.Photos); err != nil {
 		t.Fatalf("AddFiles() error = %v", err)
 	}
 
@@ -128,7 +128,7 @@ func TestAddFilesPreservesFirstItemForDuplicateFileID(t *testing.T) {
 		KeyDecryptionNonce: "second-key-nonce",
 	}
 
-	if err := repository.AddFiles(t.Context(), collectionID, ownerID, []ente.CollectionFileItem{first, second}, ownerID); err != nil {
+	if err := repository.AddFiles(t.Context(), collectionID, ownerID, []ente.CollectionFileItem{first, second}, ownerID, ente.Photos); err != nil {
 		t.Fatalf("AddFiles() error = %v", err)
 	}
 
@@ -148,7 +148,7 @@ func TestAddFilesRollsBackBatchOnFailure(t *testing.T) {
 		collectionMembershipTestItem(int64(^uint64(0) >> 1)),
 	}
 
-	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID); err == nil {
+	if err := repository.AddFiles(t.Context(), collectionID, ownerID, files, ownerID, ente.Photos); err == nil {
 		t.Fatal("AddFiles() succeeded with a nonexistent file")
 	}
 
@@ -169,7 +169,7 @@ func TestAddFilesHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if err := repository.AddFiles(ctx, collectionID, ownerID, []ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID); err == nil {
+	if err := repository.AddFiles(ctx, collectionID, ownerID, []ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID, ente.Photos); err == nil {
 		t.Fatal("AddFiles() succeeded with a canceled context")
 	}
 
@@ -197,7 +197,7 @@ func TestAddFilesRejectsTrashedFileInsideTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := repository.AddFiles(t.Context(), collectionID, ownerID, []ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID)
+	err := repository.AddFiles(t.Context(), collectionID, ownerID, []ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID, ente.Photos)
 	if !errors.Is(err, &ente.ErrFileInTrash) {
 		t.Fatalf("AddFiles() error = %v, want ErrFileInTrash", err)
 	}
@@ -220,7 +220,7 @@ func TestAddFilesAndTrashFilesSerializeOnFile(t *testing.T) {
 	lockReleaseTime := runFileLockRace(t, db, fileID, func() {
 		go func() {
 			addResult <- repository.AddFiles(t.Context(), destinationCollectionID, ownerID,
-				[]ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID)
+				[]ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID, ente.Photos)
 		}()
 		go func() {
 			trashResult <- repository.TrashRepo.TrashFiles(t.Context(), ownerID, ente.TrashRequest{
@@ -449,7 +449,7 @@ func TestMoveFilesUpsertsDestinationAndDeletesSource(t *testing.T) {
 		collectionMembershipTestItem(fileIDs[0]),
 	}
 
-	if err := repository.MoveFiles(t.Context(), toCollectionID, fromCollectionID, files, ownerID, ownerID); err != nil {
+	if err := repository.MoveFiles(t.Context(), toCollectionID, fromCollectionID, files, ownerID, ownerID, ente.Photos); err != nil {
 		t.Fatalf("MoveFiles() error = %v", err)
 	}
 
@@ -503,7 +503,7 @@ func TestMoveFilesAndTrashFilesSerializeOnFile(t *testing.T) {
 	lockReleaseTime := runFileLockRace(t, db, fileID, func() {
 		go func() {
 			moveResult <- repository.MoveFiles(t.Context(), destinationCollectionID, sourceCollectionID,
-				[]ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID, ownerID)
+				[]ente.CollectionFileItem{collectionMembershipTestItem(fileID)}, ownerID, ownerID, ente.Photos)
 		}()
 		go func() {
 			trashResult <- repository.TrashRepo.TrashFiles(t.Context(), ownerID, ente.TrashRequest{

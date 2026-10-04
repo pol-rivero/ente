@@ -209,3 +209,10 @@ func (repo *CollectionRepository) GetCollectionCount(fileID int64) (int64, error
 	}
 	return count, nil
 }
+
+func (repo *CollectionRepository) HasLiveFilesTx(ctx context.Context, tx *sql.Tx, collectionIDs []int64) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM collection_files
+		WHERE collection_id = ANY($1) AND is_deleted = FALSE)`, pq.Array(collectionIDs)).Scan(&exists)
+	return exists, stacktrace.Propagate(err, "")
+}

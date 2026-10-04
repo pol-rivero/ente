@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -31,4 +32,30 @@ func TestMoveCollectionIsRateLimitedPerUser(t *testing.T) {
 	}
 	require.Equal(t, http.StatusTooManyRequests, request("1"))
 	require.Equal(t, http.StatusOK, request("2"))
+}
+
+func TestDeleteCollectionV4IsRateLimitedPerUser(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rateLimiter := NewRateLimitMiddleware(discord.NewDiscordController(nil, "test", "test"), 1000, time.Minute)
+	t.Cleanup(rateLimiter.Stop)
+	router := gin.New()
+	router.Use(rateLimiter.APIRateLimitForUserMiddleware(func(c *gin.Context) string { return c.FullPath() }))
+	router.DELETE("/collections/v4/:collectionID", func(c *gin.Context) { c.Status(http.StatusOK) })
+	router.DELETE("/collections/v3/:collectionID", func(c *gin.Context) { c.Status(http.StatusOK) })
+	request := func(path, userID string) int {
+		req := httptest.NewRequest(http.MethodDelete, path, nil)
+		req.Header.Set("X-Auth-User-ID", userID)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response.Code
+	}
+
+	for i := range 500 {
+		require.Equal(t, http.StatusOK, request(fmt.Sprintf("/collections/v4/%d?keepFiles=false&recursive=true", i), "1"))
+	}
+	require.Equal(t, http.StatusTooManyRequests, request("/collections/v4/1?keepFiles=false&recursive=true", "1"))
+	require.Equal(t, http.StatusOK, request("/collections/v4/1?keepFiles=false&recursive=true", "2"))
+	for range 600 {
+		require.Equal(t, http.StatusOK, request("/collections/v3/1?keepFiles=false", "1"))
+	}
 }

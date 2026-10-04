@@ -69,8 +69,12 @@ func (repo *FileRepository) Create(
 	if err != nil {
 		return file, -1, stacktrace.Propagate(err, "")
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
+	if app == ente.Drive {
+		err = touchLiveDriveCollection(ctx, tx, file.UpdationTime, file.CollectionID)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = $2`, file.UpdationTime, file.CollectionID)
+	}
 	if err != nil {
 		return file, -1, stacktrace.Propagate(err, "")
 	}

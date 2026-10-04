@@ -98,6 +98,16 @@ func (pcr *CollectionLinkRepo) DisableSharing(ctx context.Context, cID int64) er
 	return nil
 }
 
+// The caller invalidates the returned tokens in Cache after committing.
+func (pcr *CollectionLinkRepo) DisableSharingForCollectionsTx(ctx context.Context, tx *sql.Tx, cIDs []int64) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `UPDATE public_collection_tokens SET is_disabled = true
+		WHERE collection_id = ANY($1) AND is_disabled = false RETURNING access_token`, pq.Array(cIDs))
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "failed to disable sharing")
+	}
+	return scanAccessTokens(rows)
+}
+
 // "Active" only means not disabled; links may be expired or over their limit.
 func (pcr *CollectionLinkRepo) GetCollectionToActivePublicURLMap(ctx context.Context, collectionIDs []int64, app ente.App) (map[int64][]ente.PublicURL, error) {
 	rows, err := pcr.DB.QueryContext(ctx, `SELECT collection_id, access_token, valid_till, device_limit, enable_download, enable_collect, enable_comment, enable_join, min_role, pw_nonce, mem_limit, ops_limit FROM

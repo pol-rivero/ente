@@ -10,6 +10,7 @@ import (
 	"github.com/ente/museum/pkg/utils/random"
 	"github.com/ente/stacktrace"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -151,6 +152,11 @@ func (r *Repository) RevokeTokenForUser(ctx context.Context, userId int64) error
 
 func (r *Repository) RevokeTokenForCollection(ctx context.Context, collectionID int64) error {
 	_, err := r.DB.ExecContext(ctx, "UPDATE casting SET is_deleted=true where collection_id=$1", collectionID)
+	return stacktrace.Propagate(err, "")
+}
+
+func (r *Repository) RevokeTokensForCollectionsTx(ctx context.Context, tx *sql.Tx, collectionIDs []int64) error {
+	_, err := tx.ExecContext(ctx, "UPDATE casting SET is_deleted=true where collection_id = ANY($1)", pq.Array(collectionIDs))
 	return stacktrace.Propagate(err, "")
 }
 

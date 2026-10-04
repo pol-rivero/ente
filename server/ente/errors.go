@@ -278,6 +278,24 @@ var ErrInvalidCollection = &ApiError{
 	HttpStatusCode: http.StatusBadRequest,
 }
 
+var ErrNotDeletableWithV4 = &ApiError{
+	Code:           InvalidCollection,
+	Message:        "Only Drive collections other than uncategorized and favorites can be deleted with this endpoint",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
+var ErrHasChildren = &ApiError{
+	Code:           HasChildren,
+	Message:        "The folder has subfolders",
+	HttpStatusCode: http.StatusConflict,
+}
+
+var ErrSubtreeTooLarge = &ApiError{
+	Code:           SubtreeTooLarge,
+	Message:        "The folder has too many subfolders to delete at once",
+	HttpStatusCode: http.StatusBadRequest,
+}
+
 var ErrCollectionTreeBusy = &ApiError{
 	Code:           CollectionTreeBusy,
 	Message:        "Another folder change is in progress, retry shortly",
@@ -368,6 +386,8 @@ const (
 	MaxDepthExceeded   ErrorCode = "MAX_DEPTH_EXCEEDED"
 	InvalidCollection  ErrorCode = "INVALID_COLLECTION"
 	CollectionTreeBusy ErrorCode = "COLLECTION_TREE_BUSY"
+	HasChildren        ErrorCode = "HAS_CHILDREN"
+	SubtreeTooLarge    ErrorCode = "SUBTREE_TOO_LARGE"
 
 	PermissionDenied     ErrorCode = "PERMISSION_DENIED"
 	StorageLimitExceeded ErrorCode = "STORAGE_LIMIT_EXCEEDED"

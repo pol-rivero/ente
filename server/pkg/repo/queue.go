@@ -24,6 +24,7 @@ var itemDeletionDelayInMinMap = map[string]int64{
 	OutdatedObjectsQueue:      -1 * 24 * 60,
 	DeleteOutdatedObjectQueue: 24 * 24 * 60, // old replaced objects may exist in compliance-protected replicas
 	TrashCollectionQueueV3:    -1 * 24 * 60,
+	TrashCollectionDriveQueue: -1 * 24 * 60,
 	TrashEmptyQueue:           -1 * 24 * 60,
 	TrashEmptyLockerQueue:     -1 * 24 * 60,
 	TrashEmptyDriveQueue:      -1 * 24 * 60,
@@ -39,6 +40,7 @@ const (
 	// Deprecated: Keeping it till we clean up items from the queue DB.
 	TrashCollectionQueue      string = "trashCollection"
 	TrashCollectionQueueV3    string = "trashCollectionV3"
+	TrashCollectionDriveQueue string = "trashCollectionDrive"
 	TrashEmptyQueue           string = "trashEmpty"
 	TrashEmptyLockerQueue     string = "trashEmptyLocker"
 	TrashEmptyDriveQueue      string = "trashEmptyDrive"
@@ -47,8 +49,9 @@ const (
 )
 
 type QueueItem struct {
-	Id   int64
-	Item string
+	Id        int64
+	Item      string
+	CreatedAt int64
 }
 
 func (repo *QueueRepository) InsertItem(ctx context.Context, queueName string, item string) error {
@@ -148,4 +151,31 @@ func (repo *QueueRepository) GetItemsReadyForDeletion(queueName string, count in
 		items = append(items, item)
 	}
 	return items, stacktrace.Propagate(err, "")
+}
+
+// Pages in (created_at, queue_id) order after the given item, so items left
+// queued by a failure aren't fetched again in the same run.
+func (repo *QueueRepository) GetItemsReadyForDeletionAfter(ctx context.Context, queueName string, after QueueItem, count int) ([]QueueItem, error) {
+	delayInMin, ok := itemDeletionDelayInMinMap[queueName]
+	if !ok {
+		return nil, stacktrace.Propagate(fmt.Errorf("missing delay for %s", queueName), "")
+	}
+	rows, err := repo.DB.QueryContext(ctx, `SELECT queue_id, item, created_at FROM queue
+		WHERE queue_name = $1 AND created_at <= $2 AND is_deleted = false
+			AND created_at >= $3 AND (created_at, queue_id) > ($3, $4)
+		ORDER BY created_at, queue_id LIMIT $5`,
+		queueName, time.MicrosecondsBeforeMinutes(delayInMin), after.CreatedAt, after.Id, count)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	defer rows.Close()
+	items := make([]QueueItem, 0)
+	for rows.Next() {
+		var item QueueItem
+		if err := rows.Scan(&item.Id, &item.Item, &item.CreatedAt); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		items = append(items, item)
+	}
+	return items, stacktrace.Propagate(rows.Err(), "")
 }

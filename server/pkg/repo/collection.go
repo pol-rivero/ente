@@ -797,6 +797,7 @@ func (repo *CollectionRepository) AddFiles(
 	collectionOwnerID int64,
 	files []ente.CollectionFileItem,
 	fileOwnerID int64,
+	collectionApp ente.App,
 ) error {
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -822,8 +823,12 @@ func (repo *CollectionRepository) AddFiles(
 	if err := upsertCollectionFiles(ctx, tx, collectionID, collectionOwnerID, files, fileOwnerID, updationTime); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
+	if collectionApp == ente.Drive {
+		err = touchLiveDriveCollection(ctx, tx, updationTime, collectionID)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 		 WHERE collection_id = $2`, updationTime, collectionID)
+	}
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -1006,6 +1011,7 @@ func (repo *CollectionRepository) MoveFiles(ctx context.Context,
 	fileItems []ente.CollectionFileItem,
 	collectionOwner int64,
 	fileOwner int64,
+	collectionApp ente.App,
 ) error {
 	if collectionOwner != fileOwner {
 		return fmt.Errorf("move is not supported when collection and file onwer are different")
@@ -1042,8 +1048,12 @@ func (repo *CollectionRepository) MoveFiles(ctx context.Context,
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
+	if collectionApp == ente.Drive {
+		err = touchLiveDriveCollection(ctx, tx, updationTime, toCollectionID, fromCollectionID)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 		 WHERE (collection_id = $2 or collection_id = $3 )`, updationTime, toCollectionID, fromCollectionID)
+	}
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -1248,31 +1258,62 @@ func (repo *CollectionRepository) removeAllFilesAddedByOthers(collectionID int64
 }
 
 func (repo *CollectionRepository) ScheduleDelete(collectionID int64) error {
-	updationTime := time.Microseconds()
-	ctx := context.Background()
+	return stacktrace.Propagate(repo.ScheduleDeletes(context.Background(), []int64{collectionID}, TrashCollectionQueueV3), "")
+}
+
+func (repo *CollectionRepository) ScheduleDeletes(ctx context.Context, collectionIDs []int64, queueName string) error {
+	if len(collectionIDs) == 0 {
+		return nil
+	}
 	tx, err := repo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `UPDATE collection_shares 
-		SET is_deleted = $1, updation_time = $2 
-		WHERE collection_id = $3`, true, updationTime, collectionID)
-	if err != nil {
+	if err := repo.ScheduleDeletesTx(ctx, tx, collectionIDs, queueName); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE collections 
-		SET is_deleted = $1, updation_time = $2 
-		WHERE collection_id = $3`, true, updationTime, collectionID)
-	if err != nil {
+	return stacktrace.Propagate(tx.Commit(), "")
+}
+
+func (repo *CollectionRepository) ScheduleDeletesTx(ctx context.Context, tx *sql.Tx, collectionIDs []int64, queueName string) error {
+	updationTime := time.Microseconds()
+	if _, err := tx.ExecContext(ctx, `UPDATE collection_shares SET is_deleted = TRUE, updation_time = $1
+		WHERE collection_id = ANY($2)`, updationTime, pq.Array(collectionIDs)); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	err = repo.QueueRepo.AddItems(ctx, tx, TrashCollectionQueueV3, []string{strconv.FormatInt(collectionID, 10)})
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE collections SET is_deleted = TRUE, updation_time = $1
+		WHERE collection_id = ANY($2)`, updationTime, pq.Array(collectionIDs)); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	err = tx.Commit()
+	items := make([]string, 0, len(collectionIDs))
+	for _, id := range collectionIDs {
+		items = append(items, strconv.FormatInt(id, 10))
+	}
+	return stacktrace.Propagate(repo.QueueRepo.AddItems(ctx, tx, queueName, items), "")
+}
+
+func (repo *CollectionRepository) LockCollectionsTx(ctx context.Context, tx *sql.Tx, collectionIDs []int64) error {
+	_, err := tx.ExecContext(ctx, `SELECT 1 FROM collections WHERE collection_id = ANY($1) ORDER BY collection_id FOR UPDATE`,
+		pq.Array(collectionIDs))
 	return stacktrace.Propagate(err, "")
+}
+
+func (repo *CollectionRepository) GetLiveDriveCollectionIDSet(ctx context.Context, ownerID int64) (map[int64]bool, error) {
+	rows, err := repo.DB.QueryContext(ctx, `SELECT collection_id FROM collections
+		WHERE owner_id = $1 AND app = $2 AND is_deleted = FALSE`, ownerID, ente.Drive)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	ids, err := scanInt64s(rows)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set, nil
 }
 
 func (repo *CollectionRepository) Rename(collectionID int64, encryptedName string, nameDecryptionNonce string) error {

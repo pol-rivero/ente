@@ -404,6 +404,16 @@ replication:
     # Optional, default value is indicated here.
     #orphan-upload-days: 14
 
+# Drive folder deletes. Optional: each key defaults to the value shown, so the
+# whole section can be left out.
+#collections:
+#    # Most live folders that one recursive delete
+#    # (DELETE /collections/v4/:id?recursive=true) may cover.
+#    max-recursive-delete: 10000
+#    # Time budget of one recursive delete, including the wait for the user's
+#    # other folder changes. Keep it below the proxies' request timeouts.
+#    recursive-delete-timeout-seconds: 30
+
 # Configuration for various background / cron jobs.
 jobs:
     cron:
@@ -414,3 +424,7 @@ jobs:
         # Number of go routines to spawn for object cleanup
         # Optional, default value is indicated here.
         worker-count: 1
+    # How long each run of the Drive folder trash job keeps processing deleted
+    # folders. Optional, defaults to the value shown.
+    #drive-collection-trash:
+    #    budget-seconds: 50

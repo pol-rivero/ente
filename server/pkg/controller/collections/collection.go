@@ -171,6 +171,9 @@ func (c *CollectionController) TrashV3(ctx *gin.Context, req ente.TrashCollectio
 		}).Warning("Collection is already deleted")
 		return nil
 	}
+	if resp.Collection.App == string(ente.Drive) {
+		return c.TrashV4(ctx.Request.Context(), userID, cID, *req.KeepFiles, false)
+	}
 
 	if *req.KeepFiles {
 		count, err := c.CollectionRepo.GetCollectionsFilesCount(cID)

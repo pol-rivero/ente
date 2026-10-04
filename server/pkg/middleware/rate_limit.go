@@ -288,7 +288,8 @@ func (r *RateLimitMiddleware) getLimiter(reqPath string, reqMethod string) *limi
 		(reqPath == "/account/space/sessions/current" && reqMethod == http.MethodDelete) {
 		return r.limit10ReqPerMin
 	}
-	if isAuthenticatedUploadURLPath(reqPath) || reqPath == "/collections/move-collection" {
+	if isAuthenticatedUploadURLPath(reqPath) || reqPath == "/collections/move-collection" ||
+		(reqPath == "/collections/v4/:collectionID" && reqMethod == http.MethodDelete) {
 		return r.limit500ReqPerMin
 	}
 	if reqPath == "/files/copy/:jobID" && reqMethod == http.MethodGet {

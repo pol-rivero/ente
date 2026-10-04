@@ -27,3 +27,8 @@ type TrashCollectionV3Request struct {
 	// move to trash.
 	KeepFiles *bool `json:"keepFiles" form:"keepFiles" binding:"required"`
 }
+
+type TrashCollectionV4Request struct {
+	KeepFiles *bool `form:"keepFiles" binding:"required"`
+	Recursive *bool `form:"recursive" binding:"required"`
+}

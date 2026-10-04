@@ -783,6 +783,7 @@ func main() {
 	storageAPI.GET("/collections/file", collectionHandler.GetFile)
 	storageAPI.GET("/collections/sharees", collectionHandler.GetSharees)
 	storageAPI.DELETE("/collections/v3/:collectionID", collectionHandler.TrashV3)
+	storageAPI.DELETE("/collections/v4/:collectionID", collectionHandler.TrashV4)
 	storageAPI.POST("/collections/rename", collectionHandler.Rename)
 	storageAPI.POST("/collections/move-collection", collectionHandler.MoveCollection)
 	storageAPI.PUT("/collections/magic-metadata", collectionHandler.PrivateMagicMetadataUpdate)
@@ -1385,6 +1386,10 @@ func setupAndStartCrons(userAuthRepo *repo.UserAuthRepository, collectionLinkRep
 
 	schedule(c, "@every 1m", func() {
 		trashController.CleanupTrashedCollections()
+	})
+
+	schedule(c, "@every 1m", func() {
+		trashController.CleanupTrashedDriveCollections()
 	})
 
 	// 101s to avoid running too many cron at same time

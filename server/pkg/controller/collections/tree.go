@@ -12,42 +12,55 @@ import (
 	"github.com/ente/museum/pkg/repo"
 	"github.com/ente/museum/pkg/utils/time"
 	"github.com/ente/stacktrace"
+	"github.com/lib/pq"
 )
 
 const (
 	maxConcurrentTreeChanges         = 8
 	maxConcurrentTreeChangesPerOwner = 2
+	maxConcurrentRecursiveDeletes    = 2
+	deadlockDetected                 = "40P01"
 )
 
 // Tree transactions hold a pooled connection while they wait for the tree
 // lock. The process slots bound how many can wait at once, and the per-owner
 // slots stop one user from taking all of them; waiting for either holds no
-// connection. The timeout bounds both waits plus the transaction.
+// connection. The timeout bounds both waits plus the transaction. Recursive
+// deletes run much longer, so they get their own slots and don't hold up
+// the quick changes.
 var (
 	collectionTreeSlots      = make(chan struct{}, maxConcurrentTreeChanges)
+	recursiveDeleteSlots     = make(chan struct{}, maxConcurrentRecursiveDeletes)
 	collectionTreeOwnerSlots = controller.NewKeyedSlots(maxConcurrentTreeChangesPerOwner)
 	collectionTreeTimeout    = 5 * gTime.Second
 )
 
 func (c *CollectionController) changeCollectionTree(ctx context.Context, ownerID int64, change func(ctx context.Context, tx *sql.Tx) error) error {
-	ctx, cancel := context.WithTimeout(ctx, collectionTreeTimeout)
+	return c.changeCollectionTreeWithin(ctx, ownerID, collectionTreeSlots, collectionTreeTimeout, change)
+}
+
+func (c *CollectionController) changeCollectionTreeWithin(ctx context.Context, ownerID int64, slots chan struct{}, timeout gTime.Duration, change func(ctx context.Context, tx *sql.Tx) error) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	releaseOwner, ok := collectionTreeOwnerSlots.Acquire(ctx, ownerID)
 	if !ok {
 		return stacktrace.Propagate(ente.ErrCollectionTreeBusy, "no free tree change slot for owner")
 	}
 	defer releaseOwner()
-	release, ok := controller.AcquireSlot(ctx, collectionTreeSlots)
+	release, ok := controller.AcquireSlot(ctx, slots)
 	if !ok {
 		return stacktrace.Propagate(ente.ErrCollectionTreeBusy, "no free tree change slot")
 	}
 	defer release()
-	err := c.CollectionRepo.InCollectionTreeTx(ctx, ownerID, collectionTreeTimeout, func(tx *sql.Tx) error {
+	err := c.CollectionRepo.InCollectionTreeTx(ctx, ownerID, timeout, func(tx *sql.Tx) error {
 		return change(ctx, tx)
 	})
 	var apiErr *ente.ApiError
+	var pqErr *pq.Error
 	if err != nil && !errors.As(err, &apiErr) &&
-		(errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, repo.ErrCollectionTreeLockTimeout)) {
+		(errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, repo.ErrCollectionTreeLockTimeout) ||
+			// Row locks taken by concurrent file moves can deadlock with a delete.
+			(errors.As(err, &pqErr) && pqErr.Code == deadlockDetected)) {
 		return stacktrace.Propagate(ente.ErrCollectionTreeBusy, "%v", err)
 	}
 	return stacktrace.Propagate(err, "")

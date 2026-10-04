@@ -128,9 +128,23 @@ func (t *TrashRepository) TrashFiles(ctx context.Context, userID int64, trash en
 	if err := lockFiles(ctx, tx, userID, fileIDs); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
+	accessTokens, err := t.trashLockedFiles(ctx, tx, userID, fileIDs, trash)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if err = tx.Commit(); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	t.FileLinkRepo.Cache.Invalidate(accessTokens...)
+	return nil
+}
+
+// The caller must hold the file locks (lockFiles) and invalidate the returned
+// file link tokens after committing.
+func (t *TrashRepository) trashLockedFiles(ctx context.Context, tx *sql.Tx, userID int64, fileIDs []int64, trash ente.TrashRequest) ([]string, error) {
 	photosFileDelta, lockerFileDelta, ambiguousFileApp, err := activeOwnedFileCountDeltas(ctx, tx, userID, fileIDs)
 	if err != nil {
-		return stacktrace.Propagate(err, "failed to calculate file count transition")
+		return nil, stacktrace.Propagate(err, "failed to calculate file count transition")
 	}
 	if ambiguousFileApp {
 		logrus.WithFields(logrus.Fields{
@@ -142,14 +156,14 @@ func (t *TrashRepository) TrashFiles(ctx context.Context, userID int64, trash en
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT collection_id FROM 
 			collection_files WHERE file_id = ANY($1) AND is_deleted = $2`, pq.Array(fileIDs), false)
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return nil, stacktrace.Propagate(err, "")
 	}
 	defer rows.Close()
 	cIDs := make([]int64, 0)
 	for rows.Next() {
 		var cID int64
 		if err := rows.Scan(&cID); err != nil {
-			return stacktrace.Propagate(err, "")
+			return nil, stacktrace.Propagate(err, "")
 		}
 		cIDs = append(cIDs, cID)
 	}
@@ -157,20 +171,20 @@ func (t *TrashRepository) TrashFiles(ctx context.Context, userID int64, trash en
 			SET is_deleted = $1, updation_time = $2 WHERE file_id = ANY($3)`,
 		true, updationTime, pq.Array(fileIDs))
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return nil, stacktrace.Propagate(err, "")
 	}
 	_, err = tx.ExecContext(ctx, `UPDATE collections SET updation_time = $1
 			WHERE collection_id = ANY ($2)`, updationTime, pq.Array(cIDs))
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return nil, stacktrace.Propagate(err, "")
 	}
 	err = t.InsertItems(ctx, tx, userID, trash.TrashItems)
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return nil, stacktrace.Propagate(err, "")
 	}
 	accessTokens, err := t.FileLinkRepo.DisableLinkForFilesTx(ctx, tx, fileIDs)
 	if err != nil {
-		return stacktrace.Propagate(err, "failed to disable file links for files being trashed")
+		return nil, stacktrace.Propagate(err, "failed to disable file links for files being trashed")
 	}
 	if photosFileDelta != 0 || lockerFileDelta != 0 || ambiguousFileApp {
 		if _, err := applyUsageChange(ctx, tx, userID, usageChange{
@@ -178,14 +192,10 @@ func (t *TrashRepository) TrashFiles(ctx context.Context, userID int64, trash en
 			LockerFileDelta:      lockerFileDelta,
 			InvalidateFileCounts: ambiguousFileApp,
 		}); err != nil {
-			return stacktrace.Propagate(err, "failed to update file counts")
+			return nil, stacktrace.Propagate(err, "failed to update file counts")
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	t.FileLinkRepo.Cache.Invalidate(accessTokens...)
-	return nil
+	return accessTokens, nil
 }
 
 func (t *TrashRepository) CleanUpDeletedFilesFromCollection(ctx context.Context, fileIDs []int64, userID int64) error {
