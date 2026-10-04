@@ -115,3 +115,26 @@ func TestObjectCopiesReplicationAttempts(t *testing.T) {
 	require.NoError(t, err)
 	require.InDelta(t, time.Now().Add(-23*time.Hour).UnixMicro(), got.LastAttempt, float64(time.Minute.Microseconds()))
 }
+
+func TestListAbandonedRetriesFailedAbortsLast(t *testing.T) {
+	db := setupReplicationRepoTest(t)
+	r := &ReplicationUploadsRepository{DB: db}
+	uploads := make(map[string]ReplicationUpload)
+	for _, uploadID := range []string{"failed", "new"} {
+		u := ReplicationUpload{ObjectKey: "1/gone-" + uploadID, DestDC: "wasabi-eu-central-2-v3", UploadID: uploadID}
+		_, err := r.Insert(t.Context(), u)
+		require.NoError(t, err)
+		uploads[uploadID] = u
+	}
+	_, err := db.Exec(`UPDATE replication_uploads SET created_at = CASE upload_id WHEN 'failed' THEN 1 ELSE 2 END`)
+	require.NoError(t, err)
+	cutoff := time.Now().Add(-time.Hour).UnixMicro()
+	abandoned, err := r.ListAbandoned(t.Context(), cutoff, 1)
+	require.NoError(t, err)
+	require.Equal(t, []ReplicationUpload{uploads["failed"]}, abandoned)
+
+	require.NoError(t, r.MarkAbortFailed(t.Context(), uploads["failed"]))
+	abandoned, err = r.ListAbandoned(t.Context(), cutoff, 1)
+	require.NoError(t, err)
+	require.Equal(t, []ReplicationUpload{uploads["new"]}, abandoned)
+}

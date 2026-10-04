@@ -19,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 )
 
@@ -34,13 +33,6 @@ func setupDeleteFixture(t *testing.T) *treeFixture {
 	clearQueue()
 	t.Cleanup(clearQueue)
 	return f
-}
-
-func setViper(t *testing.T, key string, value any) {
-	t.Helper()
-	previous := viper.Get(key)
-	viper.Set(key, value)
-	t.Cleanup(func() { viper.Set(key, previous) })
 }
 
 func (f *treeFixture) ginContext(userID int64) *gin.Context {
@@ -211,10 +203,10 @@ func TestV3DeleteOfDriveFolders(t *testing.T) {
 	child := f.folder(&parent)
 	f.addFile(child)
 
-	requireTreeAPIError(t, f.deleteV3(parent, true), http.StatusConflict, ente.HasChildren)
-	requireTreeAPIError(t, f.deleteV3(parent, false), http.StatusConflict, ente.HasChildren)
-	requireTreeAPIError(t, f.deleteV4(parent, false, false), http.StatusConflict, ente.HasChildren)
-	requireTreeAPIError(t, f.deleteV3(child, true), http.StatusConflict, ente.CollectionNotEmpty)
+	testutil.RequireAPIError(t, f.deleteV3(parent, true), http.StatusConflict, ente.HasChildren)
+	testutil.RequireAPIError(t, f.deleteV3(parent, false), http.StatusConflict, ente.HasChildren)
+	testutil.RequireAPIError(t, f.deleteV4(parent, false, false), http.StatusConflict, ente.HasChildren)
+	testutil.RequireAPIError(t, f.deleteV3(child, true), http.StatusConflict, ente.CollectionNotEmpty)
 	f.requireUnchanged([]int64{parent, child}, nil)
 
 	require.NoError(t, f.deleteV3(child, false))
@@ -235,12 +227,12 @@ func TestV3DeleteOfPhotosAndLockerCollectionsIsUnchanged(t *testing.T) {
 	for _, app := range []ente.App{ente.Photos, ente.Locker} {
 		nonEmpty := f.insert(treeTestOwnerID, app, "folder")
 		f.addFileOf(nonEmpty, app)
-		requireTreeAPIError(t, f.deleteV3(nonEmpty, true), http.StatusConflict, ente.CollectionNotEmpty)
+		testutil.RequireAPIError(t, f.deleteV3(nonEmpty, true), http.StatusConflict, ente.CollectionNotEmpty)
 
 		album := f.insert(treeTestOwnerID, app, "album")
 		require.NoError(t, f.ctrl.CollectionRepo.Share(album, treeTestOwnerID, treeTestOtherID, "share-key", ente.VIEWER, 5))
 		token := f.addLinkAndCast(album)
-		holder := holdCollectionTreeLock(t, f.db, treeTestOwnerID)
+		holder := testutil.HoldCollectionTreeLock(t, f.db, treeTestOwnerID)
 		require.NoError(t, f.deleteV3(album, true))
 		require.NoError(t, holder.Rollback())
 		require.True(t, f.isDeleted(album))
@@ -259,9 +251,9 @@ func TestDeleteRejectsInvalidRequests(t *testing.T) {
 	f := setupDeleteFixture(t)
 	folder := f.folder(nil)
 	othersFolder := f.insert(treeTestOtherID, ente.Drive, "folder")
-	requireTreeAPIError(t, f.deleteV4(othersFolder, false, true), http.StatusNotFound, ente.NotFoundError)
+	testutil.RequireAPIError(t, f.deleteV4(othersFolder, false, true), http.StatusNotFound, ente.NotFoundError)
 	require.ErrorIs(t, f.deleteV3(othersFolder, false), ente.ErrPermissionDenied)
-	requireTreeAPIError(t, f.deleteV4(1_000_000, false, true), http.StatusNotFound, ente.NotFoundError)
+	testutil.RequireAPIError(t, f.deleteV4(1_000_000, false, true), http.StatusNotFound, ente.NotFoundError)
 	require.False(t, f.isDeleted(folder))
 	require.False(t, f.isDeleted(othersFolder))
 }
@@ -273,11 +265,11 @@ func TestRecursiveDeleteSubtreeLimit(t *testing.T) {
 	for _, id := range tree {
 		tokens[id] = f.addLinkAndCast(id)
 	}
-	setViper(t, "collections.max-recursive-delete", len(tree)-1)
-	requireTreeAPIError(t, f.deleteV4(tree[0], false, true), http.StatusBadRequest, ente.SubtreeTooLarge)
+	testutil.SetViper(t, "collections.max-recursive-delete", len(tree)-1)
+	testutil.RequireAPIError(t, f.deleteV4(tree[0], false, true), http.StatusBadRequest, ente.SubtreeTooLarge)
 	f.requireUnchanged(tree, tokens)
 
-	setViper(t, "collections.max-recursive-delete", len(tree))
+	testutil.SetViper(t, "collections.max-recursive-delete", len(tree))
 	require.NoError(t, f.deleteV4(tree[0], false, true))
 	for _, id := range tree {
 		require.True(t, f.isDeleted(id))
@@ -289,7 +281,7 @@ func TestRecursiveDeleteKeepFilesNeedsAnEmptySubtree(t *testing.T) {
 	f := setupDeleteFixture(t)
 	tree := f.threeLevelTree()
 	fileID := f.addFile(tree[len(tree)-1])
-	requireTreeAPIError(t, f.deleteV4(tree[0], true, true), http.StatusConflict, ente.CollectionNotEmpty)
+	testutil.RequireAPIError(t, f.deleteV4(tree[0], true, true), http.StatusConflict, ente.CollectionNotEmpty)
 	f.requireUnchanged(tree, nil)
 
 	_, err := f.db.Exec(`UPDATE collection_files SET is_deleted = TRUE WHERE file_id = $1`, fileID)
@@ -325,10 +317,10 @@ func TestConcurrentV3DeleteAndCreateNeverLeaveALiveChildOfADeletedParent(t *test
 			func() error { return f.deleteV3(parent, true) },
 		)
 		if errs[1] == nil {
-			requireTreeAPIError(t, errs[0], http.StatusBadRequest, ente.InvalidParent)
+			testutil.RequireAPIError(t, errs[0], http.StatusBadRequest, ente.InvalidParent)
 		} else {
 			require.NoError(t, errs[0])
-			requireTreeAPIError(t, errs[1], http.StatusConflict, ente.HasChildren)
+			testutil.RequireAPIError(t, errs[1], http.StatusConflict, ente.HasChildren)
 		}
 	}
 	var orphans int
@@ -341,8 +333,8 @@ func TestRecursiveDeleteGetsALongerBudget(t *testing.T) {
 	f := setupDeleteFixture(t)
 	tree := f.threeLevelTree()
 	setCollectionTreeLimits(t, maxConcurrentTreeChanges, 300*gTime.Millisecond)
-	setViper(t, "collections.recursive-delete-timeout-seconds", 5)
-	holder := holdCollectionTreeLock(t, f.db, treeTestOwnerID)
+	testutil.SetViper(t, "collections.recursive-delete-timeout-seconds", 5)
+	holder := testutil.HoldCollectionTreeLock(t, f.db, treeTestOwnerID)
 	go func() {
 		gTime.Sleep(gTime.Second)
 		_ = holder.Rollback()
@@ -352,7 +344,7 @@ func TestRecursiveDeleteGetsALongerBudget(t *testing.T) {
 		func() error { return f.deleteV3(tree[len(tree)-1], false) },
 	)
 	require.NoError(t, errs[0])
-	requireTreeAPIError(t, errs[1], http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+	testutil.RequireAPIError(t, errs[1], http.StatusServiceUnavailable, ente.CollectionTreeBusy)
 	require.ElementsMatch(t, tree, f.queued(repo.TrashCollectionDriveQueue))
 }
 
@@ -384,7 +376,7 @@ func TestConcurrentDeletesDontExhaustThePool(t *testing.T) {
 	pool.SetMaxOpenConns(poolSize)
 	f.ctrl = newTreeTestController(pool)
 	setCollectionTreeLimits(t, maxConcurrentTreeChanges, 10*gTime.Second)
-	setViper(t, "collections.recursive-delete-timeout-seconds", 10)
+	testutil.SetViper(t, "collections.recursive-delete-timeout-seconds", 10)
 
 	for _, err := range runConcurrently(fns...) {
 		require.NoError(t, err)
@@ -532,7 +524,7 @@ func TestRecursiveDeletesUseTheirOwnSlots(t *testing.T) {
 	for range maxConcurrentTreeChanges {
 		collectionTreeSlots <- struct{}{}
 	}
-	requireTreeAPIError(t, f.deleteV4(child, false, false), http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+	testutil.RequireAPIError(t, f.deleteV4(child, false, false), http.StatusServiceUnavailable, ente.CollectionTreeBusy)
 	require.NoError(t, f.deleteV4(parent, false, true))
 	require.True(t, f.isDeleted(child))
 }
@@ -543,5 +535,5 @@ func TestTreeChangeDeadlocksAreReportedAsBusy(t *testing.T) {
 		func(context.Context, *sql.Tx) error {
 			return stacktrace.Propagate(&pq.Error{Code: "40P01"}, "")
 		})
-	requireTreeAPIError(t, err, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+	testutil.RequireAPIError(t, err, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
 }

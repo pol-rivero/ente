@@ -126,10 +126,7 @@ func (f *treeFixture) chain(length int) []int64 {
 
 func (f *treeFixture) insert(ownerID int64, app ente.App, collectionType string) int64 {
 	f.t.Helper()
-	var id int64
-	require.NoError(f.t, f.db.QueryRow(`INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, type, attributes, updation_time, app)
-		VALUES ($1, 'key', 'nonce', 'name', $2, '{}', 1, $3) RETURNING collection_id`, ownerID, collectionType, app).Scan(&id))
-	return id
+	return testutil.InsertCollection(f.t, f.db, ownerID, app, collectionType)
 }
 
 func (f *treeFixture) markDeleted(id int64) {
@@ -195,14 +192,6 @@ func (f *treeFixture) requireNoCycle(ids ...int64) {
 	}
 }
 
-func requireTreeAPIError(t *testing.T, err error, status int, code ente.ErrorCode) {
-	t.Helper()
-	var apiErr *ente.ApiError
-	require.True(t, errors.As(err, &apiErr), "error = %v, want %s", err, code)
-	require.Equal(t, code, apiErr.Code, "error = %v", err)
-	require.Equal(t, status, apiErr.HttpStatusCode)
-}
-
 func setCollectionTreeLimits(t *testing.T, slots int, timeout gTime.Duration) {
 	t.Helper()
 	previousSlots, previousOwnerSlots, previousTimeout := collectionTreeSlots, collectionTreeOwnerSlots, collectionTreeTimeout
@@ -251,12 +240,12 @@ func TestCreateWithParentRejectsInvalidRequests(t *testing.T) {
 	before := f.collectionCount()
 	for name, parentID := range invalidParents {
 		_, err := f.create(treeCollection(treeTestOwnerID, ente.Drive, "folder", &parentID))
-		requireTreeAPIError(t, err, http.StatusBadRequest, ente.InvalidParent)
+		testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.InvalidParent)
 		require.Equal(t, before, f.collectionCount(), name)
 	}
 	for _, collectionType := range []string{"album", "favorites", "uncategorized"} {
 		_, err := f.create(treeCollection(treeTestOwnerID, ente.Drive, collectionType, &root))
-		requireTreeAPIError(t, err, http.StatusBadRequest, ente.InvalidParent)
+		testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.InvalidParent)
 	}
 	shortKey := b64OfLen(encryptedCollectionKeyLen - 1)
 	badNonce := "!" + (*treeNonce(1))[1:]
@@ -271,7 +260,7 @@ func TestCreateWithParentRejectsInvalidRequests(t *testing.T) {
 		collection := treeCollection(treeTestOwnerID, ente.Drive, "folder", &root)
 		edit(&collection)
 		_, err := f.create(collection)
-		requireTreeAPIError(t, err, http.StatusBadRequest, ente.BadRequest)
+		testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.BadRequest)
 		require.Equal(t, before, f.collectionCount(), name)
 	}
 }
@@ -281,7 +270,7 @@ func TestCreateWithParentDepthLimit(t *testing.T) {
 	chain := f.chain(ente.MaxCollectionDepth)
 	require.Equal(t, ente.MaxCollectionDepth, f.maxLiveDepth())
 	_, err := f.create(treeCollection(treeTestOwnerID, ente.Drive, "folder", &chain[len(chain)-1]))
-	requireTreeAPIError(t, err, http.StatusBadRequest, ente.MaxDepthExceeded)
+	testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.MaxDepthExceeded)
 	f.folder(&chain[len(chain)-2])
 }
 
@@ -341,7 +330,7 @@ func TestMoveCollectionRejectsCycles(t *testing.T) {
 	top := chain[0]
 	for _, target := range []int64{top, chain[1], chain[5]} {
 		err := f.move(top, &target)
-		requireTreeAPIError(t, err, http.StatusBadRequest, ente.CollectionCycle)
+		testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.CollectionCycle)
 	}
 	require.False(t, f.stored(top).id.Valid)
 	f.requireNoCycle(chain...)
@@ -353,7 +342,7 @@ func TestMoveCollectionDepthIncludesSubtreeHeight(t *testing.T) {
 	subtree := f.chain(5)
 
 	err := f.move(subtree[0], &target[59])
-	requireTreeAPIError(t, err, http.StatusBadRequest, ente.MaxDepthExceeded)
+	testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.MaxDepthExceeded)
 	require.False(t, f.stored(subtree[0]).id.Valid)
 	require.NoError(t, f.move(subtree[0], &target[58]))
 	require.Equal(t, ente.MaxCollectionDepth, f.maxLiveDepth())
@@ -390,10 +379,10 @@ func TestMoveCollectionRejectsInvalidRequests(t *testing.T) {
 			require.True(t, errors.As(f.move(id, newParentID), &apiErr))
 			require.Equal(t, want, apiErr)
 		}
-		requireTreeAPIError(t, f.move(child, &id), http.StatusBadRequest, ente.InvalidParent)
+		testutil.RequireAPIError(t, f.move(child, &id), http.StatusBadRequest, ente.InvalidParent)
 		require.Equal(t, root, f.stored(child).id.Int64)
 	}
-	requireTreeAPIError(t, f.ctrl.MoveCollection(context.Background(), treeTestOtherID,
+	testutil.RequireAPIError(t, f.ctrl.MoveCollection(context.Background(), treeTestOtherID,
 		ente.MoveCollectionRequest{CollectionID: child, NewParentID: toParent(nil)}), http.StatusNotFound, ente.NotFoundError)
 
 	shortKey := b64OfLen(encryptedCollectionKeyLen - 1)
@@ -407,7 +396,7 @@ func TestMoveCollectionRejectsInvalidRequests(t *testing.T) {
 		"nonce only to root": {CollectionID: child, NewParentID: toParent(nil), ParentKeyNonce: treeNonce(2)},
 	} {
 		err := f.ctrl.MoveCollection(context.Background(), treeTestOwnerID, req)
-		requireTreeAPIError(t, err, http.StatusBadRequest, ente.BadRequest)
+		testutil.RequireAPIError(t, err, http.StatusBadRequest, ente.BadRequest)
 		require.Equal(t, root, f.stored(child).id.Int64, name)
 	}
 }
@@ -434,7 +423,7 @@ func requireOneSucceeded(t *testing.T, errs []error, code ente.ErrorCode) {
 	failures := 0
 	for _, err := range errs {
 		if err != nil {
-			requireTreeAPIError(t, err, http.StatusBadRequest, code)
+			testutil.RequireAPIError(t, err, http.StatusBadRequest, code)
 			failures++
 		}
 	}
@@ -472,16 +461,6 @@ func TestConcurrentCreateAndMoveNeverExceedMaxDepth(t *testing.T) {
 	}
 }
 
-func holdCollectionTreeLock(t *testing.T, db *sql.DB, ownerID int64) *sql.Tx {
-	t.Helper()
-	tx, err := db.Begin()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = tx.Rollback() })
-	_, err = tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended('ctree:' || $1::bigint, 0))`, ownerID)
-	require.NoError(t, err)
-	return tx
-}
-
 func TestTreeChangesFailFastWhenTheTreeIsBusy(t *testing.T) {
 	f := setupTreeFixture(t)
 	root := f.folder(nil)
@@ -491,12 +470,12 @@ func TestTreeChangesFailFastWhenTheTreeIsBusy(t *testing.T) {
 		t.Helper()
 		start := gTime.Now()
 		_, err := f.create(treeCollection(treeTestOwnerID, ente.Drive, "folder", &root))
-		requireTreeAPIError(t, err, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
-		requireTreeAPIError(t, f.move(child, nil), http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+		testutil.RequireAPIError(t, err, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+		testutil.RequireAPIError(t, f.move(child, nil), http.StatusServiceUnavailable, ente.CollectionTreeBusy)
 		require.Less(t, gTime.Since(start), 2*gTime.Second)
 	}
 
-	holder := holdCollectionTreeLock(t, f.db, treeTestOwnerID)
+	holder := testutil.HoldCollectionTreeLock(t, f.db, treeTestOwnerID)
 	requireBusy()
 	created, err := f.create(treeCollection(treeTestOtherID, ente.Drive, "folder", nil))
 	require.NoError(t, err)
@@ -542,7 +521,7 @@ func TestOneOwnersTreeChangesDontStarveOthers(t *testing.T) {
 	otherRoot, err := f.create(treeCollection(treeTestOtherID, ente.Drive, "folder", nil))
 	require.NoError(t, err)
 	setCollectionTreeLimits(t, maxConcurrentTreeChanges, 2*gTime.Second)
-	holder := holdCollectionTreeLock(t, f.db, treeTestOwnerID)
+	holder := testutil.HoldCollectionTreeLock(t, f.db, treeTestOwnerID)
 
 	const flood = 4 * maxConcurrentTreeChanges
 	results := make(chan error, flood)
@@ -566,7 +545,7 @@ func TestOneOwnersTreeChangesDontStarveOthers(t *testing.T) {
 	require.Equal(t, maxConcurrentTreeChangesPerOwner, lockWaiters())
 
 	for range flood {
-		requireTreeAPIError(t, <-results, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
+		testutil.RequireAPIError(t, <-results, http.StatusServiceUnavailable, ente.CollectionTreeBusy)
 	}
 	require.NoError(t, holder.Rollback())
 	require.Zero(t, collectionTreeOwnerSlots.Len())

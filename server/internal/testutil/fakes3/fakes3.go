@@ -30,6 +30,7 @@ type Op string
 const (
 	OpHead     Op = "HeadObject"
 	OpCopy     Op = "CopyObject"
+	OpDelete   Op = "DeleteObject"
 	OpCreate   Op = "CreateMultipartUpload"
 	OpPartCopy Op = "UploadPartCopy"
 	OpComplete Op = "CompleteMultipartUpload"
@@ -102,6 +103,17 @@ type Server struct {
 	stall           func(Request) bool
 	pageSize        int
 	omitNextMarkers bool
+	quirks          ListQuirks
+}
+
+// Quirks of S3-compatible stores' truncated listings.
+type ListQuirks struct {
+	// ListParts reports every page as truncated.
+	AlwaysTruncatedParts bool
+	// Upload listings leave out NextUploadIdMarker.
+	OmitNextUploadIDMarker bool
+	// Upload listings repeat the request's markers as the next ones.
+	EchoUploadMarkers bool
 }
 
 func New(t *testing.T) *Server {
@@ -131,6 +143,12 @@ func (s *Server) SetPageSize(pageSize int, omitNextMarkers bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pageSize, s.omitNextMarkers = pageSize, omitNextMarkers
+}
+
+func (s *Server) SetListQuirks(quirks ListQuirks) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quirks = quirks
 }
 
 func (s *Server) PutObject(key string, size int64) {
@@ -231,6 +249,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case r.Method == http.MethodDelete && req.UploadID != "":
 		req.Op = OpAbort
+	case r.Method == http.MethodDelete:
+		req.Op = OpDelete
 	case r.Method == http.MethodGet && query.Has("uploads"):
 		req.Op = OpList
 		req.Key = query.Get("prefix")
@@ -398,6 +418,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		delete(s.uploads, req.UploadID)
 		_, _ = fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>%s</ETag></CompleteMultipartUploadResult>`,
 			Bucket, key, s.objects[key].ETag)
+	case OpDelete:
+		delete(s.objects, key)
+		w.WriteHeader(http.StatusNoContent)
 	case OpAbort:
 		if _, ok := s.upload(w, req); !ok {
 			return
@@ -418,7 +441,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&body, `<ListMultipartUploadsResult><Bucket>%s</Bucket><IsTruncated>%t</IsTruncated>`, Bucket, truncated)
 		if truncated && !s.omitNextMarkers {
 			last := shown[len(shown)-1]
-			fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, s.uploads[last].Key, last)
+			nextKey, nextID := s.uploads[last].Key, last
+			if s.quirks.EchoUploadMarkers {
+				nextKey, nextID = query.Get("key-marker"), query.Get("upload-id-marker")
+			}
+			if s.quirks.OmitNextUploadIDMarker {
+				nextID = ""
+			}
+			fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, nextKey, nextID)
 		}
 		for _, id := range shown {
 			fmt.Fprintf(&body, `<Upload><Key>%s</Key><UploadId>%s</UploadId><Initiated>%s</Initiated></Upload>`,
@@ -439,10 +469,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		shown, truncated := page(numbers, query.Get("max-parts"), s.pageSize)
+		truncated = truncated || s.quirks.AlwaysTruncatedParts
 		var body strings.Builder
 		fmt.Fprintf(&body, `<ListPartsResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId><IsTruncated>%t</IsTruncated>`,
 			Bucket, upload.Key, req.UploadID, truncated)
-		if truncated && !s.omitNextMarkers {
+		if truncated && !s.omitNextMarkers && len(shown) > 0 {
 			fmt.Fprintf(&body, `<NextPartNumberMarker>%d</NextPartNumberMarker>`, shown[len(shown)-1])
 		}
 		for _, number := range shown {
@@ -584,6 +615,34 @@ func (s *Server) PutPart(uploadID string, number int64, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.uploads[uploadID].Parts[number] = Part{End: int64(len(data)) - 1, ETag: md5ETag(data), Data: data}
+}
+
+// A part with only a size, like the objects PutObject creates.
+func (s *Server) PutPartSize(uploadID string, number int64, size int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uploads[uploadID].Parts[number] = Part{End: size - 1, ETag: fmt.Sprintf(`"etag-%d"`, number)}
+}
+
+// Assembles all of an upload's parts, as a client's CompleteMultipartUpload
+// listing every part would.
+func (s *Server) CompleteUpload(uploadID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	upload := s.uploads[uploadID]
+	object := Object{ETag: fmt.Sprintf(`"multipart-%s"`, upload.Key), StorageClass: upload.StorageClass}
+	withData := true
+	for _, number := range slices.Sorted(maps.Keys(upload.Parts)) {
+		part := upload.Parts[number]
+		object.Size += part.End - part.Start + 1
+		object.Data = append(object.Data, part.Data...)
+		withData = withData && part.Data != nil
+	}
+	if !withData {
+		object.Data = nil
+	}
+	s.objects[upload.Key] = object
+	delete(s.uploads, uploadID)
 }
 
 // Removes an upload the way a provider's expiry would.

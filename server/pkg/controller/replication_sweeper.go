@@ -82,7 +82,7 @@ func (c *ReplicationController3) sweepDestination(ctx context.Context, dest *Upl
 	})
 	aborted := 0
 	for _, o := range orphans {
-		if !c.abortUpload(ctx, dest, o.key, o.uploadID, logger) {
+		if c.abortUpload(ctx, dest, o.key, o.uploadID, logger) != nil {
 			continue
 		}
 		if o.stored != nil {
@@ -121,13 +121,26 @@ func (c *ReplicationController3) dropAbandonedUploadRows(ctx context.Context, cu
 		logger.WithError(err).Warn("Failed to list abandoned replication uploads")
 		return
 	}
+	dropped, failed := 0, 0
+	var abortErr error
 	for _, u := range uploads {
 		if dest := c.destination(u.DestDC); dest != nil {
-			c.abortUpload(ctx, dest, u.ObjectKey, u.UploadID, logger)
+			if err := c.tryAbortUpload(ctx, dest, u.ObjectKey, u.UploadID); err != nil {
+				failed++
+				abortErr = err
+				if err := c.ReplicationUploadsRepo.MarkAbortFailed(ctx, u); err != nil {
+					abortErr = err
+				}
+				continue
+			}
 		}
 		c.deleteUploadRow(ctx, u, logger)
+		dropped++
 	}
-	if len(uploads) > 0 {
-		logger.Infof("Dropped %d abandoned replication uploads", len(uploads))
+	if dropped > 0 {
+		logger.Infof("Dropped %d abandoned replication uploads", dropped)
+	}
+	if failed > 0 {
+		logger.WithError(abortErr).WithField("failed", failed).Warn("Failed to abort abandoned replication uploads")
 	}
 }

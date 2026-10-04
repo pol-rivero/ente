@@ -5,306 +5,136 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	gotime "time"
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/internal/testutil"
+	"github.com/ente/museum/internal/testutil/fakes3"
+	"github.com/ente/museum/pkg/repo"
 	"github.com/ente/museum/pkg/utils/time"
 	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const mib = int64(1) << 20
 
-type fakeMultipartS3 struct {
-	t               *testing.T
-	mu              sync.Mutex
-	nextID          int
-	uploads         map[string]*fakeMultipartUpload
-	objects         map[string]int64
-	pageSize        int
-	omitNextMarker  bool
-	alwaysTruncated bool
-	listCalls       int
-	requests        int
-	headMisses      map[string]int
-	headCalls       map[string]int
-	failAborts      bool
-	failDeletes     map[string]bool
-	failCreates     bool
-	beforeCreate    func(key string)
-	uploadsPageSize int
-	uploadsMarkers  uploadsMarkerMode
-	listUploadCalls int
+// Key-based helpers over fakes3.
+type fakeS3 struct {
+	*fakes3.Server
 }
 
-type uploadsMarkerMode int
-
-const (
-	uploadsMarkersNormal uploadsMarkerMode = iota
-	uploadsMarkersOmitUploadID
-	uploadsMarkersEchoRequest
-)
-
-type fakeMultipartUpload struct {
-	key   string
-	parts map[int64]int64
-}
-
-func newFakeMultipartS3(t *testing.T) (*fakeMultipartS3, string) {
+func newFakeS3(t *testing.T) fakeS3 {
 	t.Helper()
-	fake := &fakeMultipartS3{
-		t: t, uploads: map[string]*fakeMultipartUpload{}, objects: map[string]int64{}, pageSize: 1000, uploadsPageSize: 1000,
-		headMisses: map[string]int{}, headCalls: map[string]int{}, failDeletes: map[string]bool{},
-	}
-	server := httptest.NewServer(fake)
-	t.Cleanup(server.Close)
-	return fake, server.URL
+	return fakeS3{fakes3.New(t)}
 }
 
-func (f *fakeMultipartS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	key, _ := url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/test-bucket/"))
-	query := r.URL.Query()
-	isCreate := r.Method == http.MethodPost && query.Has("uploads")
-	f.mu.Lock()
-	beforeCreate := f.beforeCreate
-	f.mu.Unlock()
-	if isCreate && beforeCreate != nil {
-		beforeCreate(key)
+func (f fakeS3) uploadIDs(key string) []string {
+	var ids []string
+	for id, upload := range f.Uploads() {
+		if upload.Key == key {
+			ids = append(ids, id)
+		}
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.requests++
-	uploadID := query.Get("uploadId")
-	if query.Has("uploadId") && uploadID == "" {
-		f.t.Errorf("storage request with an empty upload ID: %s %s", r.Method, r.URL)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	switch {
-	case isCreate && f.failCreates:
-		writeAccessDenied(w)
-	case isCreate:
-		f.nextID++
-		uploadID = fmt.Sprintf("upload-%d", f.nextID)
-		f.uploads[uploadID] = &fakeMultipartUpload{key: key, parts: map[int64]int64{}}
-		_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, key, uploadID)
-	case r.Method == http.MethodGet && query.Has("uploads"):
-		f.listUploadCalls++
-		f.writeUploads(w, query.Get("prefix"), query.Get("key-marker"), query.Get("upload-id-marker"))
-	case uploadID != "":
-		upload, ok := f.uploads[uploadID]
-		if !ok || upload.key != key {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message></Error>`))
-			return
-		}
-		switch r.Method {
-		case http.MethodGet:
-			f.listCalls++
-			marker, _ := strconv.ParseInt(query.Get("part-number-marker"), 10, 64)
-			f.writeParts(w, upload, uploadID, marker)
-		case http.MethodDelete:
-			if f.failAborts {
-				writeAccessDenied(w)
-				return
-			}
-			delete(f.uploads, uploadID)
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			f.t.Errorf("unexpected storage request: %s %s", r.Method, r.URL)
-			w.WriteHeader(http.StatusBadRequest)
-		}
-	case r.Method == http.MethodHead:
-		f.headCalls[key]++
-		size, ok := f.objects[key]
-		if f.headMisses[key] > 0 {
-			f.headMisses[key]--
-			ok = false
-		}
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		w.WriteHeader(http.StatusOK)
-	case r.Method == http.MethodDelete:
-		if f.failDeletes[key] {
-			writeAccessDenied(w)
-			return
-		}
-		delete(f.objects, key)
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		f.t.Errorf("unexpected storage request: %s %s", r.Method, r.URL)
-		w.WriteHeader(http.StatusBadRequest)
-	}
+	return ids
 }
 
-func writeAccessDenied(w http.ResponseWriter) {
-	w.WriteHeader(http.StatusForbidden)
-	_, _ = w.Write([]byte(`<Error><Code>AccessDenied</Code><Message>denied</Message></Error>`))
-}
-
-func (f *fakeMultipartS3) set(update func(f *fakeMultipartS3)) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	update(f)
-}
-
-func (f *fakeMultipartS3) writeParts(w http.ResponseWriter, upload *fakeMultipartUpload, uploadID string, marker int64) {
-	numbers := make([]int64, 0, len(upload.parts))
-	for number := range upload.parts {
-		if number > marker {
-			numbers = append(numbers, number)
-		}
-	}
-	slices.Sort(numbers)
-	truncated := len(numbers) > f.pageSize || f.alwaysTruncated
-	if len(numbers) > f.pageSize {
-		numbers = numbers[:f.pageSize]
-	}
-	var body strings.Builder
-	fmt.Fprintf(&body, `<ListPartsResult><Bucket>test-bucket</Bucket><Key>%s</Key><UploadId>%s</UploadId><IsTruncated>%t</IsTruncated>`,
-		upload.key, uploadID, truncated)
-	if truncated && !f.omitNextMarker && len(numbers) > 0 {
-		fmt.Fprintf(&body, `<NextPartNumberMarker>%d</NextPartNumberMarker>`, numbers[len(numbers)-1])
-	}
-	for _, number := range numbers {
-		fmt.Fprintf(&body, `<Part><PartNumber>%d</PartNumber><ETag>"etag-%d"</ETag><Size>%d</Size></Part>`, number, number, upload.parts[number])
-	}
-	body.WriteString(`</ListPartsResult>`)
-	_, _ = w.Write([]byte(body.String()))
-}
-
-func (f *fakeMultipartS3) writeUploads(w http.ResponseWriter, prefix, keyMarker, uploadIDMarker string) {
-	type listed struct{ key, id string }
-	uploads := make([]listed, 0)
-	for id, upload := range f.uploads {
-		after := upload.key > keyMarker || (upload.key == keyMarker && id > uploadIDMarker)
-		if strings.HasPrefix(upload.key, prefix) && after {
-			uploads = append(uploads, listed{upload.key, id})
-		}
-	}
-	slices.SortFunc(uploads, func(a, b listed) int { return strings.Compare(a.key+"\x00"+a.id, b.key+"\x00"+b.id) })
-	truncated := len(uploads) > f.uploadsPageSize
-	if truncated {
-		uploads = uploads[:f.uploadsPageSize]
-	}
-	var body strings.Builder
-	fmt.Fprintf(&body, `<ListMultipartUploadsResult><Bucket>test-bucket</Bucket><IsTruncated>%t</IsTruncated>`, truncated)
-	if truncated {
-		nextKey, nextID := uploads[len(uploads)-1].key, uploads[len(uploads)-1].id
-		switch f.uploadsMarkers {
-		case uploadsMarkersOmitUploadID:
-			nextID = ""
-		case uploadsMarkersEchoRequest:
-			nextKey, nextID = keyMarker, uploadIDMarker
-		}
-		fmt.Fprintf(&body, `<NextKeyMarker>%s</NextKeyMarker><NextUploadIdMarker>%s</NextUploadIdMarker>`, nextKey, nextID)
-	}
-	for _, upload := range uploads {
-		fmt.Fprintf(&body, `<Upload><Key>%s</Key><UploadId>%s</UploadId></Upload>`, upload.key, upload.id)
-	}
-	body.WriteString(`</ListMultipartUploadsResult>`)
-	_, _ = w.Write([]byte(body.String()))
-}
-
-func (f *fakeMultipartS3) startUpload(key string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.nextID++
-	id := fmt.Sprintf("upload-%d", f.nextID)
-	f.uploads[id] = &fakeMultipartUpload{key: key, parts: map[int64]int64{}}
-	return id
-}
-
-func (f *fakeMultipartS3) upload(key string) *fakeMultipartUpload {
-	for _, upload := range f.uploads {
-		if upload.key == key {
-			return upload
-		}
-	}
-	return nil
-}
-
-func (f *fakeMultipartS3) uploadPart(t *testing.T, key string, number int64, size int64) {
+func (f fakeS3) uploadID(t *testing.T, key string) string {
 	t.Helper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	upload := f.upload(key)
-	require.NotNil(t, upload, key)
-	upload.parts[number] = size
+	ids := f.uploadIDs(key)
+	require.Len(t, ids, 1, key)
+	return ids[0]
 }
 
-func (f *fakeMultipartS3) complete(t *testing.T, key string) {
+func (f fakeS3) uploadPart(t *testing.T, key string, number int64, size int64) {
 	t.Helper()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for id, upload := range f.uploads {
-		if upload.key == key {
-			var size int64
-			for _, partSize := range upload.parts {
-				size += partSize
-			}
-			f.objects[key] = size
-			delete(f.uploads, id)
-			return
-		}
-	}
-	t.Fatalf("no upload for %s", key)
+	f.PutPartSize(f.uploadID(t, key), number, size)
 }
 
-func (f *fakeMultipartS3) putObject(key string, size int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.objects[key] = size
+func (f fakeS3) complete(t *testing.T, key string) {
+	t.Helper()
+	f.CompleteUpload(f.uploadID(t, key))
 }
 
-func (f *fakeMultipartS3) dropUpload(key string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for id, upload := range f.uploads {
-		if upload.key == key {
-			delete(f.uploads, id)
-		}
+func (f fakeS3) dropUpload(key string) {
+	for _, id := range f.uploadIDs(key) {
+		f.DropUpload(id)
 	}
 }
 
-func (f *fakeMultipartS3) hasUpload(key string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.upload(key) != nil
+func (f fakeS3) hasUpload(key string) bool {
+	return len(f.uploadIDs(key)) > 0
 }
 
-func (f *fakeMultipartS3) hasObject(key string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.objects[key]
+func (f fakeS3) hasObject(key string) bool {
+	_, ok := f.Object(key)
 	return ok
 }
 
-func (f *fakeMultipartS3) requestCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.requests
+// An empty key counts the requests for every key.
+func (f fakeS3) count(op fakes3.Op, key string) int {
+	n := 0
+	for _, r := range f.RequestsOf(op) {
+		if key == "" || r.Key == key {
+			n++
+		}
+	}
+	return n
 }
 
-func setupResumeTest(t *testing.T) (*FileController, *sql.DB, *fakeMultipartS3) {
+func accessDenied() *fakes3.Failure {
+	return &fakes3.Failure{Status: http.StatusForbidden, Code: "AccessDenied"}
+}
+
+// Fails the given operation on the given keys (all keys if none).
+func (f fakeS3) failOn(op fakes3.Op, keys ...string) {
+	f.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == op && (len(keys) == 0 || slices.Contains(keys, r.Key)) {
+			return accessDenied()
+		}
+		return nil
+	})
+}
+
+// HEAD reports the key missing the next n times.
+func (f fakeS3) missHeads(key string, n int) {
+	var mu sync.Mutex
+	f.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Op != fakes3.OpHead || r.Key != key || n == 0 {
+			return nil
+		}
+		n--
+		return &fakes3.Failure{Status: http.StatusNotFound, Code: "NotFound"}
+	})
+}
+
+// Runs fn before each CreateMultipartUpload is handled.
+func (f fakeS3) beforeCreate(fn func(key string)) {
+	f.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == fakes3.OpCreate {
+			fn(r.Key)
+		}
+		return nil
+	})
+}
+
+func setupResumeTest(t *testing.T) (*FileController, *sql.DB, fakeS3) {
 	t.Helper()
 	delays := headNotFoundRetryDelays
 	headNotFoundRetryDelays = []gotime.Duration{gotime.Millisecond, gotime.Millisecond}
 	t.Cleanup(func() { headNotFoundRetryDelays = delays })
-	fake, s3URL := newFakeMultipartS3(t)
-	c, db := newUploadTestController(t, s3URL, 100*gib)
+	fake := newFakeS3(t)
+	c, db := newUploadTestController(t, fake.URL, 100*gib)
 	return c, db, fake
 }
 
@@ -370,12 +200,16 @@ func signedHeaders(t *testing.T, rawURL string) string {
 	return parsed.Query().Get("X-Amz-SignedHeaders")
 }
 
-func requireAPIError(t *testing.T, err error, status int, code ente.ErrorCode) {
+func requireResumeURLValidity(t *testing.T, resume ente.MultipartUploadResume, want gotime.Duration) {
 	t.Helper()
-	var apiErr *ente.ApiError
-	require.ErrorAs(t, err, &apiErr, "%v", err)
-	require.Equal(t, status, apiErr.HttpStatusCode, "%v", err)
-	require.Equal(t, code, apiErr.Code, "%v", err)
+	urls := slices.Collect(maps.Values(resume.PartURLs))
+	for _, rawURL := range append(urls, resume.CompleteURL) {
+		parsed, err := url.Parse(rawURL)
+		require.NoError(t, err)
+		seconds, err := strconv.ParseInt(parsed.Query().Get("X-Amz-Expires"), 10, 64)
+		require.NoError(t, err)
+		require.InDelta(t, want.Seconds(), float64(seconds), 5, rawURL)
+	}
 }
 
 func TestResumeMultipartUploadReportsProgress(t *testing.T) {
@@ -395,6 +229,7 @@ func TestResumeMultipartUploadReportsProgress(t *testing.T) {
 	require.Equal(t, []int64{1, 2, 3}, partNumbers(resume.PartURLs))
 	require.Equal(t, initialExpiry, tempObjectExpiry(t, db, upload.ObjectKey))
 	require.False(t, resumePartsCompleted(t, db, upload.ObjectKey).Valid)
+	requireResumeURLValidity(t, resume, PreSignedPartUploadRequestDuration)
 
 	fake.uploadPart(t, upload.ObjectKey, 1, 5*mib)
 	before := time.Microseconds()
@@ -417,11 +252,36 @@ func TestResumeMultipartUploadReportsProgress(t *testing.T) {
 	require.Greater(t, expiry, initialExpiry)
 	require.Equal(t, int64(1), resumePartsCompleted(t, db, upload.ObjectKey).Int64)
 
+	requireResumeURLValidity(t, resume, PreSignedPartUploadRequestDuration)
+
+	// Without progress the expiry stays, so the URLs must expire an hour
+	// before it; a row that expires sooner is gone.
+	for remaining, validity := range map[gotime.Duration]gotime.Duration{
+		3 * gotime.Hour:       2 * gotime.Hour,
+		70 * gotime.Minute:    10 * gotime.Minute,
+		64 * gotime.Minute:    0,
+		gotime.Hour:           0,
+		2 * gotime.Minute:     0,
+		30 * 24 * gotime.Hour: PreSignedPartUploadRequestDuration,
+	} {
+		shortExpiry := time.Microseconds() + remaining.Microseconds()
+		_, err = db.Exec(`UPDATE temp_objects SET expiration_time = $1, reservation_released = FALSE WHERE object_key = $2`,
+			shortExpiry, upload.ObjectKey)
+		require.NoError(t, err)
+		got, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
+		if validity == 0 {
+			testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
+			requireExpiredAndReleased(t, db, upload.ObjectKey)
+			continue
+		}
+		require.NoError(t, err)
+		require.Equal(t, shortExpiry, tempObjectExpiry(t, db, upload.ObjectKey))
+		requireResumeURLValidity(t, got, validity)
+	}
+	_, err = db.Exec(`UPDATE temp_objects SET reservation_released = FALSE WHERE object_key = $1`, upload.ObjectKey)
+	require.NoError(t, err)
 	shortExpiry := time.MicrosecondsAfterHours(1)
 	setTempObjectExpiry(t, db, upload.ObjectKey, shortExpiry)
-	_, err = c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
-	require.NoError(t, err)
-	require.Equal(t, shortExpiry, tempObjectExpiry(t, db, upload.ObjectKey))
 
 	fake.uploadPart(t, upload.ObjectKey, 2, 5*mib)
 	_, err = c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
@@ -459,11 +319,11 @@ func TestResumeMultipartUploadPaginatesParts(t *testing.T) {
 	for _, number := range []int64{1, 2, 3, 5} {
 		fake.uploadPart(t, upload.ObjectKey, number, 5*mib)
 	}
-	fake.pageSize = 2
+	fake.SetPageSize(2, false)
 
 	resume, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
 	require.NoError(t, err)
-	require.Equal(t, 2, fake.listCalls)
+	require.Equal(t, 2, fake.count(fakes3.OpListPart, ""))
 	got := make([]int64, 0)
 	for _, part := range resume.CompletedParts {
 		got = append(got, part.PartNumber)
@@ -478,17 +338,18 @@ func TestResumeMultipartUploadPaginatesWithoutNextMarker(t *testing.T) {
 	for _, number := range []int64{1, 2, 3, 5} {
 		fake.uploadPart(t, upload.ObjectKey, number, 5*mib)
 	}
-	fake.set(func(f *fakeMultipartS3) { f.pageSize = 2; f.omitNextMarker = true })
+	fake.SetPageSize(2, true)
 
 	resume, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
 	require.NoError(t, err)
 	require.Len(t, resume.CompletedParts, 4)
 	require.Equal(t, []int64{4}, partNumbers(resume.PartURLs))
 
-	fake.set(func(f *fakeMultipartS3) { f.alwaysTruncated = true; f.listCalls = 0 })
+	fake.SetListQuirks(fakes3.ListQuirks{AlwaysTruncatedParts: true})
+	listsBefore := fake.count(fakes3.OpListPart, "")
 	_, err = c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
 	require.ErrorContains(t, err, "did not advance")
-	require.Equal(t, 3, fake.listCalls)
+	require.Equal(t, 3, fake.count(fakes3.OpListPart, "")-listsBefore)
 }
 
 func TestResumeMultipartUploadTreatsWrongSizedPartsAsMissing(t *testing.T) {
@@ -518,7 +379,7 @@ func TestResumeMultipartUploadAfterLostCompleteResponse(t *testing.T) {
 	}
 	fake.complete(t, upload.ObjectKey)
 	setTempObjectExpiry(t, db, upload.ObjectKey, time.MicrosecondsAfterHours(1))
-	fake.set(func(f *fakeMultipartS3) { f.headMisses[upload.ObjectKey] = len(headNotFoundRetryDelays) })
+	fake.missHeads(upload.ObjectKey, len(headNotFoundRetryDelays))
 
 	before := time.Microseconds()
 	resume, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
@@ -534,7 +395,7 @@ func TestResumeMultipartUploadAfterLostCompleteResponse(t *testing.T) {
 
 	thumbKey := uploadLimitsKey("resume-thumb", 10)
 	stageUploadLimitsObjects(t, db, thumbKey)
-	fake.putObject(thumbKey, 10)
+	fake.PutObject(thumbKey, 10)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/files", nil)
 	file, err := c.Create(ctx, uploadLimitsUserID, objectCleanupTestFile(uploadLimitsUserID, collectionID, upload.ObjectKey, thumbKey), "", ente.Drive, false)
@@ -542,8 +403,8 @@ func TestResumeMultipartUploadAfterLostCompleteResponse(t *testing.T) {
 	require.Equal(t, 12*mib, file.File.Size)
 
 	_, err = c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
-	requireAPIError(t, err, http.StatusGone, ente.UploadGone)
-	requireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey), http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey), http.StatusGone, ente.UploadGone)
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.True(t, fake.hasObject(upload.ObjectKey))
 }
@@ -560,11 +421,11 @@ func TestResumeMultipartUploadGoneWhenObjectMissing(t *testing.T) {
 
 	for _, key := range []string{aborted.ObjectKey, truncated.ObjectKey} {
 		_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, key)
-		requireAPIError(t, err, http.StatusGone, ente.UploadGone)
+		testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
 		requireExpiredAndReleased(t, db, key)
 	}
-	require.Equal(t, len(headNotFoundRetryDelays)+1, fake.headCalls[aborted.ObjectKey])
-	require.Equal(t, 1, fake.headCalls[truncated.ObjectKey])
+	require.Equal(t, len(headNotFoundRetryDelays)+1, fake.count(fakes3.OpHead, aborted.ObjectKey))
+	require.Equal(t, 1, fake.count(fakes3.OpHead, truncated.ObjectKey))
 
 	require.Equal(t, 2, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.False(t, fake.hasObject(truncated.ObjectKey))
@@ -605,10 +466,10 @@ func TestResumeAndAbortRejectForeignAndUnsupportedUploads(t *testing.T) {
 	photos := startResumeTestUpload(t, c, ente.Photos, 12*mib, nil)
 	locker := startResumeTestUpload(t, c, ente.Locker, 12*mib, nil)
 	fake.uploadPart(t, photos.ObjectKey, 1, 5*mib)
-	requestsBefore := fake.requestCount()
+	requestsBefore := len(fake.Requests())
 
-	notFound := func(err error) { requireAPIError(t, err, http.StatusNotFound, ente.NotFoundError) }
-	gone := func(err error) { requireAPIError(t, err, http.StatusGone, ente.UploadGone) }
+	notFound := func(err error) { testutil.RequireAPIError(t, err, http.StatusNotFound, ente.NotFoundError) }
+	gone := func(err error) { testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone) }
 	notDrive := func(err error) { requireBadRequestMessage(t, err, "not a Drive multipart upload") }
 	for _, tt := range []struct {
 		key         string
@@ -638,7 +499,7 @@ func TestResumeAndAbortRejectForeignAndUnsupportedUploads(t *testing.T) {
 		_ = db.QueryRow(`SELECT expiration_time FROM temp_objects WHERE object_key = $1`, tt.key).Scan(&after)
 		require.Equal(t, expiry, after, tt.key)
 	}
-	require.Equal(t, requestsBefore, fake.requestCount(), "rejected requests reached storage")
+	require.Equal(t, requestsBefore, len(fake.Requests()), "rejected requests reached storage")
 	require.True(t, fake.hasUpload(photos.ObjectKey))
 	require.False(t, resumePartsCompleted(t, db, photos.ObjectKey).Valid)
 
@@ -654,7 +515,7 @@ func TestResumeAndAbortFailFastOnLockedRow(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 2*gotime.Second)
 		defer cancel()
 		start := gotime.Now()
-		requireAPIError(t, call(ctx), status, code)
+		testutil.RequireAPIError(t, call(ctx), status, code)
 		require.Less(t, gotime.Since(start), gotime.Second)
 	}
 	resume := func(ctx context.Context) error {
@@ -711,8 +572,8 @@ func TestAbortMultipartUploadLeavesRowForCleanup(t *testing.T) {
 		require.LessOrEqual(t, expiry, time.Microseconds())
 		require.True(t, released)
 		_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, key)
-		requireAPIError(t, err, http.StatusGone, ente.UploadGone)
-		requireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, key), http.StatusGone, ente.UploadGone)
+		testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
+		testutil.RequireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, key), http.StatusGone, ente.UploadGone)
 	}
 	require.True(t, fake.hasObject(completed.ObjectKey))
 
@@ -735,15 +596,15 @@ func TestAbortMultipartUploadSucceedsWhenStorageAbortFails(t *testing.T) {
 	c, db, fake := setupResumeTest(t)
 	upload := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
 	fake.uploadPart(t, upload.ObjectKey, 1, 5*mib)
-	fake.set(func(f *fakeMultipartS3) { f.failAborts = true })
+	fake.failOn(fakes3.OpAbort)
 
 	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey))
 	requireExpiredAndReleased(t, db, upload.ObjectKey)
 	require.True(t, fake.hasUpload(upload.ObjectKey))
 	_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
-	requireAPIError(t, err, http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
 
-	fake.set(func(f *fakeMultipartS3) { f.failAborts = false })
+	fake.SetHook(nil)
 	require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.False(t, fake.hasUpload(upload.ObjectKey))
 	require.Empty(t, tempObjectKeys(t, db))
@@ -756,15 +617,15 @@ func TestReleasedUploadStaysGoneAfterCleanupRetryDelay(t *testing.T) {
 	fake.complete(t, upload.ObjectKey)
 	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey))
 
-	fake.set(func(f *fakeMultipartS3) { f.failDeletes[upload.ObjectKey] = true })
+	fake.failOn(fakes3.OpDelete, upload.ObjectKey)
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.Greater(t, tempObjectExpiry(t, db, upload.ObjectKey), time.Microseconds())
 
-	requestsBefore := fake.requestCount()
+	requestsBefore := len(fake.Requests())
 	_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey)
-	requireAPIError(t, err, http.StatusGone, ente.UploadGone)
-	requireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey), http.StatusGone, ente.UploadGone)
-	require.Equal(t, requestsBefore, fake.requestCount())
+	testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, upload.ObjectKey), http.StatusGone, ente.UploadGone)
+	require.Equal(t, requestsBefore, len(fake.Requests()))
 	require.True(t, fake.hasObject(upload.ObjectKey))
 }
 
@@ -779,7 +640,7 @@ func TestCreateAfterAbortOfCompletedUploadKeepsObject(t *testing.T) {
 
 	thumbKey := uploadLimitsKey("abort-thumb", 10)
 	stageUploadLimitsObjects(t, db, thumbKey)
-	fake.putObject(thumbKey, 10)
+	fake.PutObject(thumbKey, 10)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/files", nil)
 	file, err := c.Create(ctx, uploadLimitsUserID, objectCleanupTestFile(uploadLimitsUserID, collectionID, upload.ObjectKey, thumbKey), "", ente.Drive, false)
@@ -836,9 +697,187 @@ func TestNonDriveMultipartUploadsUnchanged(t *testing.T) {
 	_, err = db.Exec(`UPDATE temp_objects SET expiration_time = 1`)
 	require.NoError(t, err)
 	require.Equal(t, 3, c.ObjectCleanupCtrl.removeUnreportedObjects())
-	require.Zero(t, fake.listUploadCalls)
+	require.Zero(t, fake.count(fakes3.OpList, ""))
 	var remaining int
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM temp_objects`).Scan(&remaining))
 	require.Zero(t, remaining)
 	require.False(t, fake.hasUpload(legacy.ObjectKey))
+}
+
+func TestResumeDoesNotHoldAPooledConnectionDuringStorageCalls(t *testing.T) {
+	c, db, fake := setupResumeTest(t)
+	const resumes = 4
+	keys := make([]string, 0, resumes)
+	for range resumes {
+		upload := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+		fake.uploadPart(t, upload.ObjectKey, 1, 5*mib)
+		keys = append(keys, upload.ObjectKey)
+	}
+	pool, err := sql.Open("postgres", "sslmode=disable")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pool.Close() })
+	pool.SetMaxOpenConns(resumes)
+	c.ObjectCleanupRepo = &repo.ObjectCleanupRepository{DB: pool}
+	listing := make(chan struct{}, resumes)
+	fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == fakes3.OpListPart {
+			listing <- struct{}{}
+			gotime.Sleep(2 * gotime.Second)
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		wg.Go(func() {
+			resume, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, key)
+			assert.NoError(t, err)
+			assert.Len(t, resume.CompletedParts, 1)
+		})
+	}
+	for range resumes {
+		<-listing
+	}
+	start := gotime.Now()
+	var one int
+	require.NoError(t, pool.QueryRow(`SELECT 1`).Scan(&one))
+	require.Less(t, gotime.Since(start), gotime.Second)
+	// A Create of the same key doesn't wait for the resumes either.
+	tx, err := db.Begin()
+	require.NoError(t, err)
+	defer tx.Rollback()
+	_, err = tx.Exec(`SET LOCAL lock_timeout = 500`)
+	require.NoError(t, err)
+	_, err = tx.Exec(`DELETE FROM temp_objects WHERE object_key = $1`, keys[0])
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback())
+	wg.Wait()
+	for _, key := range keys {
+		require.Equal(t, int64(1), resumePartsCompleted(t, db, key).Int64)
+	}
+}
+
+func TestResumeReportsGoneWhenTheRowChangesDuringStorageCalls(t *testing.T) {
+	c, db, fake := setupResumeTest(t)
+	inProgress := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	fake.uploadPart(t, inProgress.ObjectKey, 1, 5*mib)
+	assembled := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	fake.uploadPart(t, assembled.ObjectKey, 1, 12*mib)
+	fake.complete(t, assembled.ObjectKey)
+	idle := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	var mu sync.Mutex
+	expired := make(map[string]bool)
+	fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		mu.Lock()
+		defer mu.Unlock()
+		if (r.Op == fakes3.OpListPart || r.Op == fakes3.OpHead) && !expired[r.Key] {
+			// A concurrent abort or cron pass while the resume talks to storage.
+			expired[r.Key] = true
+			assert.NoError(t, c.ObjectCleanupRepo.ExpireTempObjectNow(context.Background(), r.Key, uploadLimitsUserID))
+		}
+		return nil
+	})
+	for _, key := range []string{inProgress.ObjectKey, assembled.ObjectKey, idle.ObjectKey} {
+		_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, key)
+		testutil.RequireAPIError(t, err, http.StatusGone, ente.UploadGone)
+		requireExpiredAndReleased(t, db, key)
+		require.False(t, resumePartsCompleted(t, db, key).Valid)
+	}
+}
+
+// The cron holds expired rows locked across S3 calls; resume must not wait.
+func TestResumeIsBusyWhenTheRowIsLockedDuringStorageCalls(t *testing.T) {
+	c, db, fake := setupResumeTest(t)
+	inProgress := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	fake.uploadPart(t, inProgress.ObjectKey, 1, 5*mib)
+	assembled := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	fake.uploadPart(t, assembled.ObjectKey, 1, 12*mib)
+	fake.complete(t, assembled.ObjectKey)
+	truncated := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	fake.uploadPart(t, truncated.ObjectKey, 1, 5*mib)
+	fake.complete(t, truncated.ObjectKey)
+	holder, err := db.Begin()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	var mu sync.Mutex
+	locked := make(map[string]bool)
+	fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		mu.Lock()
+		defer mu.Unlock()
+		if (r.Op == fakes3.OpListPart || r.Op == fakes3.OpHead) && !locked[r.Key] {
+			locked[r.Key] = true
+			_, err := holder.Exec(`SELECT 1 FROM temp_objects WHERE object_key = $1 FOR UPDATE`, r.Key)
+			assert.NoError(t, err)
+		}
+		return nil
+	})
+	for _, key := range []string{inProgress.ObjectKey, assembled.ObjectKey, truncated.ObjectKey} {
+		expiry := tempObjectExpiry(t, db, key)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*gotime.Second)
+		start := gotime.Now()
+		_, err := c.ResumeMultipartUpload(ctx, uploadLimitsUserID, key)
+		cancel()
+		testutil.RequireAPIError(t, err, http.StatusConflict, ente.UploadBusy)
+		require.Less(t, gotime.Since(start), 2*gotime.Second, key)
+		require.Equal(t, expiry, tempObjectExpiry(t, db, key))
+	}
+}
+
+func TestPendingDriveUploads(t *testing.T) {
+	c, db, _ := setupResumeTest(t)
+	otherUserID := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 2, Email: "pending-other@ente.com", CreationTime: 1})
+	before := time.Microseconds()
+	multipart := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	single, err := c.GetUploadURLWithMetadata(t.Context(), uploadLimitsUserID,
+		ente.UploadURLRequest{ContentLength: 10, ContentMD5: "XUFAKrxLKna5cZ2REBfFkg=="}, ente.Drive, "client", false)
+	require.NoError(t, err)
+	aborted := startResumeTestUpload(t, c, ente.Drive, 12*mib, nil)
+	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, aborted.ObjectKey))
+	startResumeTestUpload(t, c, ente.Photos, 12*mib, nil)
+	_, err = startPublicDriveUpload(c, 12*mib)
+	require.NoError(t, err)
+	expiry := time.MicrosecondsAfterDays(1)
+	_, err = db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, purpose, content_length, part_length)
+		VALUES ('2/other', $1, 'b2-eu-cen', $2, 'drive', 'file_upload', 10, 10),
+		       ('1/pending', $1, 'b2-eu-cen', $3, 'drive', 'file_upload', 10, 10),
+		       ('1/expired', 5, 'b2-eu-cen', $3, 'drive', 'file_upload', 10, 10)`, expiry, otherUserID, uploadLimitsUserID)
+	require.NoError(t, err)
+	after := time.Microseconds()
+
+	pending, err := c.GetPendingDriveUploads(t.Context(), uploadLimitsUserID, "")
+	require.NoError(t, err)
+	require.False(t, pending.HasMore)
+	byKey := make(map[string]ente.PendingUpload)
+	for _, upload := range pending.Uploads {
+		require.GreaterOrEqual(t, upload.CreatedAt, before)
+		require.LessOrEqual(t, upload.CreatedAt, after)
+		require.Equal(t, tempObjectExpiry(t, db, upload.ObjectKey), upload.ExpiresAt)
+		upload.CreatedAt, upload.ExpiresAt = 0, 0
+		byKey[upload.ObjectKey] = upload
+	}
+	require.Equal(t, map[string]ente.PendingUpload{
+		multipart.ObjectKey: {ObjectKey: multipart.ObjectKey, ContentLength: 12 * mib, IsMultipart: true},
+		single.ObjectKey:    {ObjectKey: single.ObjectKey, ContentLength: 10},
+		"1/pending":         {ObjectKey: "1/pending", ContentLength: 10, IsMultipart: true},
+	}, byKey)
+
+	previous := pendingUploadsPageSize
+	pendingUploadsPageSize = 2
+	t.Cleanup(func() { pendingUploadsPageSize = previous })
+	var paged []string
+	for after, hasMore := "", true; hasMore; {
+		page, err := c.GetPendingDriveUploads(t.Context(), uploadLimitsUserID, after)
+		require.NoError(t, err)
+		require.LessOrEqual(t, len(page.Uploads), 2)
+		for _, upload := range page.Uploads {
+			paged = append(paged, upload.ObjectKey)
+		}
+		hasMore = page.HasMore
+		if hasMore {
+			after = paged[len(paged)-1]
+		}
+	}
+	require.Len(t, paged, 3)
+	require.True(t, slices.IsSorted(paged))
+	require.ElementsMatch(t, slices.Collect(maps.Keys(byKey)), paged)
 }

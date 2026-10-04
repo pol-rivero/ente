@@ -223,7 +223,8 @@ func isAuthenticatedUploadURLPath(reqPath string) bool {
 		reqPath == "/files/multipart-upload-urls" ||
 		reqPath == "/files/multipart-upload-url" ||
 		reqPath == "/files/multipart-upload-url/resume" ||
-		reqPath == "/files/multipart-upload"
+		reqPath == "/files/multipart-upload" ||
+		reqPath == "/files/uploads"
 }
 
 // Synchronous copies stay unlimited, as before.

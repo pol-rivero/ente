@@ -525,7 +525,7 @@ func TestDriveCopyCommitsSizesAndIsAdmitted(t *testing.T) {
 	var once sync.Once
 	f.fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
 		if r.Op == fakes3.OpCopy {
-			once.Do(func() { f.setActorUsage(gib) })
+			once.Do(func() { f.setActorUsage(gib - 600*mib - 1000) })
 		}
 		return nil
 	})
@@ -539,7 +539,7 @@ func TestDriveCopyCommitsSizesAndIsAdmitted(t *testing.T) {
 	require.Zero(t, f.tempRowCount())
 	var usage int64
 	require.NoError(t, f.db.QueryRow(`SELECT storage_consumed FROM usage WHERE user_id = $1`, actorID).Scan(&usage))
-	require.Equal(t, gib+600*mib+1000, usage)
+	require.Equal(t, gib, usage)
 }
 
 func TestDriveCopyReservesRowsBeforeCopying(t *testing.T) {

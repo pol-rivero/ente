@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -752,7 +753,7 @@ func TestStreamingReplicationHeartbeat(t *testing.T) {
 	require.NoError(t, err)
 	newJob := func() *streamJob {
 		return &streamJob{c: rt.c, cfg: rt.c.stream, key: key, logger: log.WithField("test", t.Name()),
-			lease: replicationLease{lastAttempt: copies.LastAttempt, confirmedAt: time.Now()}}
+			leaseLock: make(chan struct{}, 1), lease: replicationLease{lastAttempt: copies.LastAttempt, confirmedAt: time.Now()}}
 	}
 
 	j := newJob()
@@ -1178,4 +1179,40 @@ func TestCountingReadSeekerSkipsHashingPass(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, rt.wasabi.RequestsOf(fakes3.OpUpload)[0].ContentMD5)
 	require.Equal(t, int64(len(data)), moved.Load())
+}
+
+func TestSweepRetriesFailingAbandonedUploadsLast(t *testing.T) {
+	rt := setupReplicationTest(t)
+	for _, uploadID := range []string{"failing-1", "failing-2", "ok"} {
+		rt.insertUploadRow(t, replicationKey("gone-"+uploadID), scwDC, uploadID, "")
+	}
+	_, err := rt.db.Exec(`UPDATE replication_uploads SET created_at = 1`)
+	require.NoError(t, err)
+	rt.scw.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == fakes3.OpAbort && strings.HasPrefix(r.UploadID, "failing") {
+			return &fakes3.Failure{Status: http.StatusForbidden, Code: "AccessDenied"}
+		}
+		return nil
+	})
+	hook := captureLogs(t)
+
+	rt.c.sweepOrphanUploads(t.Context())
+
+	require.Equal(t, []string{
+		replicationKey("gone-failing-1") + " " + scwDC + " failing-1",
+		replicationKey("gone-failing-2") + " " + scwDC + " failing-2",
+	}, rt.uploadRows(t))
+	var unmarked int
+	require.NoError(t, rt.db.QueryRow(`SELECT count(*) FROM replication_uploads WHERE abort_failed_at = 0`).Scan(&unmarked))
+	require.Zero(t, unmarked)
+	warnings := 0
+	for _, entry := range hook.AllEntries() {
+		require.Greater(t, entry.Level, log.ErrorLevel, entry.Message)
+		if entry.Level == log.WarnLevel {
+			warnings++
+			require.Equal(t, "Failed to abort abandoned replication uploads", entry.Message)
+			require.Equal(t, 2, entry.Data["failed"])
+		}
+	}
+	require.Equal(t, 1, warnings)
 }

@@ -69,6 +69,9 @@ func (c *CollectionController) Create(ctx context.Context, collection ente.Colle
 		return ente.Collection{}, stacktrace.Propagate(fmt.Errorf("unexpected collection type %s", collection.Type), "")
 	}
 	if isDrive {
+		if collection.HasInvalidParentFields() {
+			return ente.Collection{}, ente.NewBadRequestWithMessage("parentID must be an integer, parentEncryptedKey and parentKeyNonce strings")
+		}
 		if err := validateParentFields(collection.ParentID, collection.ParentEncryptedKey, collection.ParentKeyNonce); err != nil {
 			return ente.Collection{}, stacktrace.Propagate(err, "")
 		}

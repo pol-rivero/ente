@@ -320,6 +320,12 @@ var ErrCopyAttemptsExceeded = &ApiError{
 	HttpStatusCode: http.StatusInternalServerError,
 }
 
+var ErrTooManyCopyJobs = &ApiError{
+	Code:           TooManyCopyJobs,
+	Message:        "Too many copies are unfinished, retry after one finishes",
+	HttpStatusCode: http.StatusTooManyRequests,
+}
+
 var ErrLockerRegistrationDisabled = &ApiError{
 	Code:           LockerRegistrationDisabled,
 	Message:        "Locker is restricted to paid users currently",
@@ -396,6 +402,7 @@ const (
 	CopyReservationLost  ErrorCode = "COPY_RESERVATION_LOST"
 	CopyAttemptsExceeded ErrorCode = "COPY_ATTEMPTS_EXCEEDED"
 	CopySourceChanged    ErrorCode = "COPY_SOURCE_CHANGED"
+	TooManyCopyJobs      ErrorCode = "TOO_MANY_COPY_JOBS"
 
 	SessionExpired ErrorCode = "SESSION_EXPIRED"
 

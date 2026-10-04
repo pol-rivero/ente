@@ -93,6 +93,7 @@ func TestResumeAndAbortUseUploadURLRateLimiter(t *testing.T) {
 		{http.MethodPost, "/files/multipart-upload-url"},
 		{http.MethodPost, "/files/multipart-upload-url/resume"},
 		{http.MethodDelete, "/files/multipart-upload"},
+		{http.MethodGet, "/files/uploads"},
 	} {
 		if got := rateLimiter.getLimiter(tt.path, tt.method); got != rateLimiter.limit500ReqPerMin {
 			t.Errorf("getLimiter(%s %s) is not the upload-URL limiter", tt.method, tt.path)

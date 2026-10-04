@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,11 +39,12 @@ const (
 	defaultOrphanUploadDays   = 14
 	streamingMinPartSize      = int64(64) << 20
 	streamingMaxParts         = 1000
-	streamingPartAlignment    = int64(1) << 20
 	streamingPartsInFlight    = 2
 	replicationRepickWindow   = 24 * time.Hour
 	streamingRetryAfter       = time.Hour
 	streamingDeferral         = 10 * time.Minute
+	streamingShutdownRetry    = 2 * time.Minute
+	streamingHandBackTimeout  = 10 * time.Second
 	workerRangeFailureLimit   = 3
 	workerReprobeInterval     = time.Hour
 )
@@ -58,6 +61,7 @@ var (
 	errLeaseLost          = errors.New("object was picked by another replication attempt")
 	errNoActiveTargets    = errors.New("no destination left to upload to")
 	errInsufficientDisk   = errors.New("insufficient disk space for streaming replication")
+	errStopping           = errors.New("replication is stopping")
 )
 
 type streamingConfig struct {
@@ -147,12 +151,7 @@ func (c *ReplicationController3) streamsObject(ctx context.Context, objectKey st
 }
 
 func streamingPartSize(size int64, minPartSize int64) (int64, error) {
-	partSize := max(minPartSize, s3copy.CeilDiv(size, streamingMaxParts))
-	partSize = s3copy.CeilDiv(partSize, streamingPartAlignment) * streamingPartAlignment
-	if partSize > ente.MaxMultipartPartSize {
-		return 0, stacktrace.NewError("object of %d bytes needs %d-byte parts, above the %d-byte limit", size, partSize, ente.MaxMultipartPartSize)
-	}
-	return partSize, nil
+	return s3copy.Options{MinPartSize: minPartSize, MaxParts: streamingMaxParts}.CheckedPartSize(size)
 }
 
 func transferTimeout(length int64) time.Duration {
@@ -183,7 +182,12 @@ type streamJob struct {
 	sourceETag string
 	logger     *log.Entry
 	moved      atomic.Int64
+
+	// Guards lease and handedBack across their DB writes; a channel so that
+	// shutdown can give up waiting.
+	leaseLock  chan struct{}
 	lease      replicationLease
+	handedBack bool
 
 	mu      sync.Mutex
 	targets []*streamTarget
@@ -204,8 +208,14 @@ func (c *ReplicationController3) replicateStreaming(ctx context.Context, copies 
 		partSize:  partSize,
 		partCount: s3copy.CeilDiv(size, partSize),
 		logger:    logger.WithField("replication_path", "streaming"),
+		leaseLock: make(chan struct{}, 1),
 		lease:     replicationLease{lastAttempt: copies.LastAttempt, confirmedAt: time.Now()},
 	}
+	if !c.trackStreamJob(j) {
+		c.retryAttemptAfter(j.key, j.lease.lastAttempt, streamingShutdownRetry, j.logger)
+		return stacktrace.Propagate(errStopping, "")
+	}
+	defer c.untrackStreamJob(j)
 	if copies.WantWasabi && copies.Wasabi == nil {
 		j.targets = append(j.targets, &streamTarget{dest: c.wasabiDest, markCopy: func() error {
 			return c.ObjectCopiesRepo.MarkObjectReplicatedWasabi(j.key)
@@ -241,6 +251,40 @@ func (c *ReplicationController3) replicateStreaming(ctx context.Context, copies 
 func (c *ReplicationController3) deferStreaming(copies *ente.ObjectCopies, logger *log.Entry) {
 	logger.Info("All streaming replication slots are busy, deferring the object")
 	c.retryAttemptAfter(copies.ObjectKey, copies.LastAttempt, streamingDeferral, logger)
+}
+
+func (c *ReplicationController3) trackStreamJob(j *streamJob) bool {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	if c.stopping.Load() {
+		return false
+	}
+	if c.streamJobs == nil {
+		c.streamJobs = make(map[*streamJob]struct{})
+	}
+	c.streamJobs[j] = struct{}{}
+	return true
+}
+
+func (c *ReplicationController3) untrackStreamJob(j *streamJob) {
+	c.streamMu.Lock()
+	defer c.streamMu.Unlock()
+	delete(c.streamJobs, j)
+}
+
+// Lets the next attempt, on any instance, resume the uploads within minutes
+// instead of after the 24 h repick window that the heartbeat keeps renewing.
+func (c *ReplicationController3) handBackStreamJobs() {
+	c.streamMu.Lock()
+	jobs := slices.Collect(maps.Keys(c.streamJobs))
+	c.streamMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), streamingHandBackTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		wg.Go(func() { j.handBackLease(ctx) })
+	}
+	wg.Wait()
 }
 
 func (c *ReplicationController3) retryAttemptAfter(objectKey string, lastAttempt int64, after time.Duration, logger *log.Entry) {
@@ -402,7 +446,10 @@ func (j *streamJob) openUpload(ctx context.Context, t *streamTarget) error {
 	if stored != nil {
 		if stored.PartSize != j.partSize || etagsDiffer(stored.SourceETag, j.sourceETag) {
 			logger.Infof("Discarding upload %s made for a different source or part size", stored.UploadID)
-			j.c.dropUpload(t.dest, j.key, stored.UploadID, true, logger)
+			// Its row must go before a new upload can be recorded.
+			if err := j.c.dropUpload(t.dest, j.key, stored.UploadID, true, logger); err != nil {
+				return err
+			}
 		} else {
 			etags, err := j.listParts(ctx, t.dest, stored.UploadID)
 			if err == nil {
@@ -622,19 +669,16 @@ func (j *streamJob) fetchPart(ctx context.Context, spool *os.File, reservation *
 }
 
 func (j *streamJob) uploadPart(ctx context.Context, t *streamTarget, part int64, spool *os.File, length int64) (string, error) {
-	for attempt := 0; ; attempt++ {
-		etag, err := j.uploadPartOnce(ctx, t, part, spool, length)
-		if err == nil {
-			return etag, nil
-		}
-		if attempt >= len(j.cfg.uploadRetryDelays) || ctx.Err() != nil || !isTransientS3Error(err) {
-			return "", err
+	retryable := func(err error) bool {
+		if !isTransientS3Error(err) {
+			return false
 		}
 		j.logger.WithError(err).WithField("destination", t.dest.Label).Infof("Retrying upload of part %d", part)
-		if err := sleepWithContext(ctx, j.cfg.uploadRetryDelays[attempt]); err != nil {
-			return "", err
-		}
+		return true
 	}
+	return s3copy.RetryTransient(ctx, j.cfg.uploadRetryDelays, retryable, func() (string, error) {
+		return j.uploadPartOnce(ctx, t, part, spool, length)
+	})
 }
 
 func (j *streamJob) uploadPartOnce(ctx context.Context, t *streamTarget, part int64, spool *os.File, length int64) (string, error) {
@@ -771,12 +815,15 @@ func (c *ReplicationController3) destination(dc string) *UploadDestination {
 	return nil
 }
 
-// Best effort: an upload left behind is aborted by the sweeper.
-func (c *ReplicationController3) dropUpload(dest *UploadDestination, objectKey string, uploadID string, abort bool, logger *log.Entry) {
+// The row stays if the abort fails, so that the sweeper retries it.
+func (c *ReplicationController3) dropUpload(dest *UploadDestination, objectKey string, uploadID string, abort bool, logger *log.Entry) error {
 	if abort {
-		c.abortUpload(context.Background(), dest, objectKey, uploadID, logger)
+		if err := c.abortUpload(context.Background(), dest, objectKey, uploadID, logger); err != nil {
+			return err
+		}
 	}
 	c.deleteUploadRow(context.Background(), repo.ReplicationUpload{ObjectKey: objectKey, DestDC: dest.DC, UploadID: uploadID}, logger)
+	return nil
 }
 
 func (c *ReplicationController3) deleteUploadRow(ctx context.Context, u repo.ReplicationUpload, logger *log.Entry) {
@@ -787,7 +834,16 @@ func (c *ReplicationController3) deleteUploadRow(ctx context.Context, u repo.Rep
 	}
 }
 
-func (c *ReplicationController3) abortUpload(ctx context.Context, dest *UploadDestination, objectKey string, uploadID string, logger *log.Entry) bool {
+func (c *ReplicationController3) abortUpload(ctx context.Context, dest *UploadDestination, objectKey string, uploadID string, logger *log.Entry) error {
+	err := c.tryAbortUpload(ctx, dest, objectKey, uploadID)
+	if err != nil {
+		logger.WithError(err).WithFields(log.Fields{"destination": dest.Label, "upload_id": uploadID}).Warn("Failed to abort multipart upload")
+	}
+	return err
+}
+
+// An upload that no longer exists counts as aborted.
+func (c *ReplicationController3) tryAbortUpload(ctx context.Context, dest *UploadDestination, objectKey string, uploadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, c.stream.metadataTimeout)
 	defer cancel()
 	_, err := dest.Client.AbortMultipartUploadWithContext(ctx, &s3.AbortMultipartUploadInput{
@@ -796,10 +852,9 @@ func (c *ReplicationController3) abortUpload(ctx context.Context, dest *UploadDe
 		UploadId: &uploadID,
 	})
 	if err != nil && !isUnknownUploadError(err) {
-		logger.WithError(err).WithFields(log.Fields{"destination": dest.Label, "upload_id": uploadID}).Warn("Failed to abort multipart upload")
-		return false
+		return stacktrace.Propagate(err, "Failed to abort upload %s in bucket %s", uploadID, *dest.Bucket)
 	}
-	return true
+	return nil
 }
 
 func (c *ReplicationController3) dropStoredUploads(objectKey string, logger *log.Entry) {
@@ -842,7 +897,42 @@ func (j *streamJob) heartbeat(ctx context.Context, cancel context.CancelCauseFun
 	}
 }
 
+func (j *streamJob) lockLease(ctx context.Context) bool {
+	select {
+	case j.leaseLock <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (j *streamJob) unlockLease() {
+	<-j.leaseLock
+}
+
+// After a hand-back the CAS fails, so this attempt stops at its next beat.
+func (j *streamJob) handBackLease(ctx context.Context) {
+	if !j.lockLease(ctx) {
+		j.logger.Warn("Timed out handing back the replication attempt")
+		return
+	}
+	defer j.unlockLease()
+	j.handedBack = true
+	if err := j.c.ObjectCopiesRepo.RetryReplicationAttemptAfter(ctx, j.key, j.lease.lastAttempt, streamingShutdownRetry); err != nil {
+		j.logger.WithError(err).Warn("Failed to hand back the replication attempt")
+		return
+	}
+	j.logger.Info("Handed back the replication attempt")
+}
+
 func (j *streamJob) beat(ctx context.Context) bool {
+	if !j.lockLease(ctx) {
+		return true
+	}
+	defer j.unlockLease()
+	if j.handedBack {
+		return false
+	}
 	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	next, ok, err := j.c.ObjectCopiesRepo.ExtendReplicationAttempt(hctx, j.key, j.lease.lastAttempt)

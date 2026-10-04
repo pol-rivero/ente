@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -13,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/ente/museum/ente"
 	"github.com/ente/stacktrace"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -22,7 +22,6 @@ const (
 	// Not 5 GiB: B2's CopyObject rejects sources above 5 × 10⁹ bytes (rclone uses the same cutoff).
 	MaxSingleCopySize = int64(4768) << 20
 	MinPartSize       = int64(256) << 20
-	MaxPartSize       = int64(5) << 30
 	DefaultWorkers    = 8
 	partAlignment     = int64(1) << 20
 	abortTimeout      = 2 * time.Minute
@@ -74,6 +73,14 @@ func (o Options) PartSize(size int64) int64 {
 	return CeilDiv(partSize, partAlignment) * partAlignment
 }
 
+func (o Options) CheckedPartSize(size int64) (int64, error) {
+	partSize := o.PartSize(size)
+	if partSize > ente.MaxMultipartPartSize {
+		return 0, stacktrace.NewError("object of %d bytes needs %d-byte parts, above the %d-byte limit", size, partSize, ente.MaxMultipartPartSize)
+	}
+	return partSize, nil
+}
+
 func Copy(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey string, size int64, opts Options) error {
 	if opts.IsMultipart(size) {
 		return CopyMultipart(ctx, client, bucket, srcKey, dstKey, size, opts)
@@ -89,34 +96,17 @@ func Copy(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey string, siz
 	return stacktrace.Propagate(err, "")
 }
 
+// Keys are <userID>/<uuid> and need no escaping, as in the legacy CopyObject.
 func copySource(bucket, key string) string {
-	return escapePath(bucket) + "/" + escapePath(key)
-}
-
-func escapePath(path string) string {
-	var b strings.Builder
-	for i := 0; i < len(path); i++ {
-		c := path[i]
-		if isUnreserved(c) || c == '/' {
-			b.WriteByte(c)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", c)
-		}
-	}
-	return b.String()
-}
-
-func isUnreserved(c byte) bool {
-	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' ||
-		c == '-' || c == '_' || c == '.' || c == '~'
+	return bucket + "/" + key
 }
 
 // CopyMultipart ignores opts.MaxSingleCopySize.
 func CopyMultipart(ctx context.Context, client *s3.S3, bucket, srcKey, dstKey string, size int64, opts Options) (err error) {
 	source := copySource(bucket, srcKey)
-	partSize := opts.PartSize(size)
-	if partSize > MaxPartSize {
-		return stacktrace.NewError("object of %d bytes needs %d-byte parts, above the %d-byte limit", size, partSize, MaxPartSize)
+	partSize, err := opts.CheckedPartSize(size)
+	if err != nil {
+		return err
 	}
 	headCtx, cancelHead := withTimeout(ctx, opts.MetadataTimeout)
 	head, err := client.HeadObjectWithContext(headCtx, &s3.HeadObjectInput{Bucket: &bucket, Key: &srcKey})
@@ -201,18 +191,26 @@ func copyParts(ctx context.Context, client *s3.S3, bucket, source, dstKey, uploa
 }
 
 func copyPart(ctx context.Context, client *s3.S3, input *s3.UploadPartCopyInput) (string, error) {
+	return RetryTransient(ctx, retryDelays, IsTransient, func() (string, error) {
+		return copyPartOnce(ctx, client, input)
+	})
+}
+
+// Calls fn until it succeeds, the delays run out, or retryable rejects its
+// error; retryable is only asked when a retry would follow.
+func RetryTransient[T any](ctx context.Context, delays []time.Duration, retryable func(error) bool, fn func() (T, error)) (T, error) {
 	for attempt := 0; ; attempt++ {
-		eTag, err := copyPartOnce(ctx, client, input)
-		if err == nil {
-			return eTag, nil
+		v, err := fn()
+		if err == nil || attempt >= len(delays) || ctx.Err() != nil || !retryable(err) {
+			return v, err
 		}
-		if attempt >= len(retryDelays) || ctx.Err() != nil || !IsTransient(err) {
-			return "", err
-		}
+		timer := time.NewTimer(delays[attempt])
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(retryDelays[attempt]):
+			timer.Stop()
+			var zero T
+			return zero, ctx.Err()
+		case <-timer.C:
 		}
 	}
 }

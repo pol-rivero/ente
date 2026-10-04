@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,8 @@ type ReplicationController3 struct {
 	LockController         *lock.LockController
 	stream                 *streamingConfig
 	stopping               atomic.Bool
+	streamMu               sync.Mutex
+	streamJobs             map[*streamJob]struct{}
 }
 
 type UploadDestination struct {
@@ -99,8 +102,12 @@ func (c *ReplicationController3) StartReplication() error {
 }
 
 // In-flight attempts aren't waited for: they resume (streaming) or retry.
+// Streaming attempts hand their object back first.
 func (c *ReplicationController3) StopReplication() {
+	c.streamMu.Lock()
 	c.stopping.Store(true)
+	c.streamMu.Unlock()
+	c.handBackStreamJobs()
 }
 
 func (c *ReplicationController3) startWorkers(n int) {
@@ -274,7 +281,12 @@ func (c *ReplicationController3) tryReplicate(ctx context.Context) error {
 			return nil
 		}
 		defer c.stream.slots.Release(1)
-		return done(c.replicateStreaming(ctx, copies, ob.Size, logger))
+		err := c.replicateStreaming(ctx, copies, ob.Size, logger)
+		if errors.Is(err, errStopping) {
+			logger.Info("Replication is stopping, handed the object back")
+			return nil
+		}
+		return done(err)
 	}
 
 	err = fileutil.EnsureSufficientSpace(ob.Size)

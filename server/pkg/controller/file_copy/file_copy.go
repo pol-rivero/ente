@@ -181,7 +181,7 @@ func (fc *FileCopyController) loadCopySources(ctx context.Context, userID int64,
 	if err != nil {
 		return "", nil, false, err
 	}
-	if (app == ente.Drive || dstApp == ente.Drive) && app != dstApp {
+	if ente.IsCrossAppWithDrive(app, dstApp) {
 		return "", nil, false, stacktrace.Propagate(&ente.ErrCrossAppFile, "copy into a %s collection with app %s", dstApp, app)
 	}
 	fileIDs := make([]int64, 0, len(req.CollectionFileItems))
@@ -283,6 +283,7 @@ func (fc *FileCopyController) driveTempObjects(userID int64, client string, file
 				Purpose:       "file_upload",
 				ContentLength: &size,
 				Client:        client,
+				IsCopy:        true,
 			}
 			if opts.IsMultipart(size) {
 				partSize := opts.PartSize(size)

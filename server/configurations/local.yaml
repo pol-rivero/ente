@@ -400,6 +400,10 @@ replication:
     # Disk space, in bytes, that the parts of streamed objects may use in
     # tmp-storage at any time. Optional, defaults to 42949672960 (40 GiB).
     #spool-budget: 42949672960
+    # Most objects that may stream at once per process, so that multi-day
+    # Drive replications leave workers for Photos and Locker objects.
+    # Optional, defaults to max(1, worker-count / 3).
+    #streaming-workers: 2
     # Unfinished replication uploads older than this many days are aborted.
     # Optional, default value is indicated here.
     #orphan-upload-days: 14

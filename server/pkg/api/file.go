@@ -262,6 +262,15 @@ func (h *FileHandler) AbortMultipartUpload(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
+func (h *FileHandler) GetPendingUploads(c *gin.Context) {
+	uploads, err := h.Controller.GetPendingDriveUploads(c.Request.Context(), auth.GetUserID(c.Request.Header), c.Query("after"))
+	if err != nil {
+		handler.Error(c, stacktrace.Propagate(err, ""))
+		return
+	}
+	c.JSON(http.StatusOK, uploads)
+}
+
 const legacyUploadsGoneMessage = "This upload API is no longer supported. Please update your app."
 
 func (h *FileHandler) RestrictLegacyUploads(c *gin.Context) {

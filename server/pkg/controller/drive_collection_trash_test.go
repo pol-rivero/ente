@@ -42,10 +42,7 @@ func setupDriveTrashFixture(t *testing.T) *driveTrashFixture {
 
 func (f *driveTrashFixture) collection(ownerID int64, app ente.App, collectionType string) int64 {
 	f.t.Helper()
-	var id int64
-	require.NoError(f.t, f.db.QueryRow(`INSERT INTO collections(owner_id, encrypted_key, key_decryption_nonce, name, type, attributes, updation_time, app)
-		VALUES ($1, 'key', 'nonce', 'name', $2, '{}', 1, $3) RETURNING collection_id`, ownerID, collectionType, app).Scan(&id))
-	return id
+	return testutil.InsertCollection(f.t, f.db, ownerID, app, collectionType)
 }
 
 func (f *driveTrashFixture) file(ownerID int64, app ente.App, collectionIDs ...int64) int64 {
@@ -150,7 +147,7 @@ func TestDriveCollectionTrashKeepsFilesThatAreStillInLiveFolders(t *testing.T) {
 	}
 }
 
-func TestTrashCollectionPicksTheMethodAndLockByStoredApp(t *testing.T) {
+func TestTrashCollectionQueuesRouteItemsByStoredApp(t *testing.T) {
 	f := setupDriveTrashFixture(t)
 	driveFolder := f.collection(driveTrashOwner, ente.Drive, "folder")
 	liveDriveFolder := f.collection(driveTrashOwner, ente.Drive, "folder")
@@ -164,16 +161,29 @@ func TestTrashCollectionPicksTheMethodAndLockByStoredApp(t *testing.T) {
 	f.holdLock(fmt.Sprintf("CollectionTrash:%d", driveTrashOwner))
 	f.ctrl.CleanupTrashedCollections()
 	require.Zero(t, f.queued(repo.TrashCollectionQueueV3))
+	require.Equal(t, 2, f.queued(repo.TrashCollectionDriveQueue))
+	require.True(t, f.live(driveFile, driveFolder))
+	f.releaseLock(fmt.Sprintf("CollectionTrash:%d", driveTrashOwner))
+
+	hook := captureLogs(t)
+	f.ctrl.CleanupTrashedDriveCollections()
+	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
+	require.Equal(t, 1, f.queued(repo.TrashCollectionQueueV3))
 	require.False(t, f.inTrash(driveFile))
 	require.False(t, f.live(driveFile, driveFolder))
 	require.True(t, f.live(driveFile, liveDriveFolder))
+	require.True(t, f.live(photo, album))
+	misrouted := 0
+	for _, entry := range hook.AllEntries() {
+		if entry.Level <= logrus.ErrorLevel {
+			require.Equal(t, "queued collection isn't a Drive collection, moving it to the V3 queue", entry.Message)
+			misrouted++
+		}
+	}
+	require.Equal(t, 1, misrouted)
 
-	f.ctrl.CleanupTrashedDriveCollections()
-	require.Equal(t, 1, f.queued(repo.TrashCollectionDriveQueue))
-	f.releaseLock(fmt.Sprintf("CollectionTrash:%d", driveTrashOwner))
-	f.holdLock(fmt.Sprintf("CollectionTrash:%d:drive", driveTrashOwner))
-	f.ctrl.CleanupTrashedDriveCollections()
-	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
+	f.ctrl.CleanupTrashedCollections()
+	require.Zero(t, f.queued(repo.TrashCollectionQueueV3))
 	require.True(t, f.inTrash(photo))
 	require.False(t, f.live(photo, liveAlbum))
 }
@@ -197,13 +207,20 @@ func (f *driveTrashFixture) queuedNow(queueName string) int {
 	return count
 }
 
+// Fails if the two crons share a running flag or a lock.
 func TestPhotosAlbumDeleteIsNotHeldUpByADriveDrain(t *testing.T) {
 	f := setupDriveTrashFixture(t)
-	const folderCount = 600
-	f.scheduleDrive(f.foldersWithAFile(driveTrashOwner, folderCount)...)
+	stuck := f.collection(driveTrashOwner, ente.Drive, "folder")
+	stuckFile := f.file(driveTrashOwner, ente.Drive, stuck)
+	f.scheduleDrive(append([]int64{stuck}, f.foldersWithAFile(driveTrashOwner, 2)...)...)
 	album := f.collection(driveTrashOwner, ente.Photos, "album")
 	photo := f.file(driveTrashOwner, ente.Photos, album)
 	require.NoError(t, f.ctrl.CollectionRepo.ScheduleDelete(album))
+	holder, err := f.db.Begin()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	_, err = holder.Exec(`SELECT 1 FROM files WHERE file_id = $1 FOR UPDATE`, stuckFile)
+	require.NoError(t, err)
 
 	drained := make(chan struct{})
 	go func() {
@@ -211,14 +228,15 @@ func TestPhotosAlbumDeleteIsNotHeldUpByADriveDrain(t *testing.T) {
 		f.ctrl.CleanupTrashedDriveCollections()
 	}()
 	require.Eventually(t, func() bool {
-		remaining := f.queuedNow(repo.TrashCollectionDriveQueue)
-		return remaining >= 0 && remaining < folderCount
+		var waiting int
+		return f.db.QueryRow(`SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting) == nil && waiting > 0
 	}, 10*gotime.Second, gotime.Millisecond)
 	f.ctrl.CleanupTrashedCollections()
 	require.Zero(t, f.queued(repo.TrashCollectionQueueV3))
 	require.True(t, f.inTrash(photo))
-	require.Positive(t, f.queued(repo.TrashCollectionDriveQueue))
+	require.Equal(t, 3, f.queued(repo.TrashCollectionDriveQueue))
 
+	require.NoError(t, holder.Rollback())
 	<-drained
 	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
 }
@@ -229,31 +247,20 @@ func TestDriveCollectionTrashStopsAtItsBudgetAndResumes(t *testing.T) {
 	for range 5 {
 		folders = append(folders, f.collection(driveTrashOwner, ente.Drive, "folder"))
 	}
-	f.scheduleDrive(folders[:2]...)
-	busy := f.collection(driveTrashOther, ente.Drive, "folder")
-	f.scheduleDrive(busy)
-	f.scheduleDrive(folders[2:]...)
-	f.holdLock(fmt.Sprintf("CollectionTrash:%d:drive", driveTrashOther))
+	f.scheduleDrive(folders...)
 
 	f.holdLock("CollectionTrashDrive")
 	f.ctrl.CleanupTrashedDriveCollections()
-	require.Equal(t, 6, f.queued(repo.TrashCollectionDriveQueue))
+	require.Equal(t, 5, f.queued(repo.TrashCollectionDriveQueue))
 	f.releaseLock("CollectionTrashDrive")
 
 	f.ctrl.driveTrashBudgetOverride = gotime.Nanosecond
 	f.ctrl.CleanupTrashedDriveCollections()
-	require.Equal(t, 5, f.queued(repo.TrashCollectionDriveQueue))
-	f.ctrl.CleanupTrashedDriveCollections()
 	require.Equal(t, 4, f.queued(repo.TrashCollectionDriveQueue))
+	f.ctrl.CleanupTrashedDriveCollections()
+	require.Equal(t, 3, f.queued(repo.TrashCollectionDriveQueue))
 
 	f.ctrl.driveTrashBudgetOverride = 0
-	f.ctrl.CleanupTrashedDriveCollections()
-	require.Equal(t, 1, f.queued(repo.TrashCollectionDriveQueue))
-	var remaining string
-	require.NoError(t, f.db.QueryRow(`SELECT item FROM queue WHERE queue_name = $1 AND NOT is_deleted`, repo.TrashCollectionDriveQueue).Scan(&remaining))
-	require.Equal(t, fmt.Sprint(busy), remaining)
-
-	f.releaseLock(fmt.Sprintf("CollectionTrash:%d:drive", driveTrashOther))
 	f.ctrl.CleanupTrashedDriveCollections()
 	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
 }
@@ -307,7 +314,9 @@ func TestDriveCollectionTrashCanRunAgain(t *testing.T) {
 	require.NoError(t, err)
 	f.ctrl.CleanupTrashedDriveCollections()
 	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
-	require.NoError(t, f.ctrl.CollectionRepo.TrashDriveCollection(t.Context(), folder, driveTrashOwner))
+	finished, err := f.ctrl.CollectionRepo.TrashDriveCollection(t.Context(), folder, driveTrashOwner, gotime.Now(), gotime.Minute)
+	require.NoError(t, err)
+	require.True(t, finished)
 
 	require.True(t, f.inTrash(trashed))
 	require.False(t, f.inTrash(unlinked))
@@ -363,31 +372,48 @@ func TestDriveCollectionTrashReRootsLiveChildren(t *testing.T) {
 	require.False(t, f.inTrash(childFile))
 }
 
-func TestDriveCollectionTrashSkipsABusyOwnerForTheRun(t *testing.T) {
+func TestALargeDriveDeleteYieldsToTheNextItem(t *testing.T) {
 	f := setupDriveTrashFixture(t)
-	busy := make([]int64, 0, 3)
-	for range 3 {
-		busy = append(busy, f.collection(driveTrashOther, ente.Drive, "folder"))
+	large := f.collection(driveTrashOwner, ente.Drive, "folder")
+	_, err := f.db.Exec(`INSERT INTO files(owner_id, app, file_decryption_header, thumbnail_decryption_header,
+			metadata_decryption_header, encrypted_metadata, updation_time)
+		SELECT $1, 'drive', 'header', 'header', 'header', 'metadata', 1 FROM generate_series(1, 4500)`, driveTrashOwner)
+	require.NoError(t, err)
+	_, err = f.db.Exec(`INSERT INTO collection_files(collection_id, file_id, encrypted_key, key_decryption_nonce, updation_time, c_owner_id, f_owner_id)
+		SELECT $1, file_id, 'key', 'nonce', 1, $2, $2 FROM files WHERE owner_id = $2`, large, driveTrashOwner)
+	require.NoError(t, err)
+	f.scheduleDrive(large)
+	small := f.collection(driveTrashOther, ente.Drive, "folder")
+	smallFile := f.file(driveTrashOther, ente.Drive, small)
+	f.scheduleDrive(small)
+	liveInLarge := func() int {
+		var count int
+		require.NoError(t, f.db.QueryRow(`SELECT count(*) FROM collection_files WHERE collection_id = $1 AND NOT is_deleted`, large).Scan(&count))
+		return count
 	}
-	f.scheduleDrive(busy[0])
-	free := f.collection(driveTrashOwner, ente.Drive, "folder")
-	f.scheduleDrive(free)
-	f.scheduleDrive(busy[1:]...)
-	f.holdLock(fmt.Sprintf("CollectionTrash:%d:drive", driveTrashOther))
+	f.ctrl.driveTrashBudgetOverride = gotime.Nanosecond
 	hook := captureLogs(t)
 
 	f.ctrl.CleanupTrashedDriveCollections()
+	require.Equal(t, 2500, liveInLarge())
+	require.Equal(t, 2, f.queued(repo.TrashCollectionDriveQueue))
+	f.ctrl.CleanupTrashedDriveCollections()
+	require.True(t, f.inTrash(smallFile))
+	require.Equal(t, 2500, liveInLarge())
+	require.Equal(t, 1, f.queued(repo.TrashCollectionDriveQueue))
 
-	require.Equal(t, 3, f.queued(repo.TrashCollectionDriveQueue))
-	var skipped int
+	f.ctrl.driveTrashBudgetOverride = 0
+	f.ctrl.CleanupTrashedDriveCollections()
+	require.Zero(t, liveInLarge())
+	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
+	yielded := 0
 	for _, entry := range hook.AllEntries() {
 		require.Greater(t, entry.Level, logrus.ErrorLevel, entry.Message)
-		if entry.Message == "Drive collections of this user are being trashed elsewhere, skipping them" {
-			skipped++
-			require.Equal(t, logrus.InfoLevel, entry.Level)
+		if entry.Message == "collection not trashed yet, moving it to the back of the queue" {
+			yielded++
 		}
 	}
-	require.Equal(t, 1, skipped)
+	require.Equal(t, 1, yielded)
 }
 
 func TestDriveCollectionTrashStopsWhenItLosesTheRunLock(t *testing.T) {
@@ -418,6 +444,67 @@ func TestDriveCollectionTrashStopsWhenItLosesTheRunLock(t *testing.T) {
 	var lockedBy string
 	require.NoError(t, f.db.QueryRow(`SELECT locked_by FROM task_lock WHERE task_name = $1`, driveCollectionTrashLock).Scan(&lockedBy))
 	require.Equal(t, "another-host", lockedBy)
+}
+
+func TestDriveCollectionTrashStopsWhenItCantExtendTheRunLock(t *testing.T) {
+	f := setupDriveTrashFixture(t)
+	previousHeartbeat, previousLease := driveTrashLockHeartbeat, driveTrashLease
+	driveTrashLockHeartbeat, driveTrashLease = 10*gotime.Millisecond, 200*gotime.Millisecond
+	t.Cleanup(func() { driveTrashLockHeartbeat, driveTrashLease = previousHeartbeat, previousLease })
+	lockDB, err := sql.Open("postgres", "sslmode=disable")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lockDB.Close() })
+	f.ctrl.TaskLockRepo = &repo.TaskLockRepository{DB: lockDB}
+	const folderCount = 400
+	f.scheduleDrive(f.foldersWithAFile(driveTrashOwner, folderCount)...)
+	hook := captureLogs(t)
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		f.ctrl.CleanupTrashedDriveCollections()
+	}()
+	require.Eventually(t, func() bool {
+		remaining := f.queuedNow(repo.TrashCollectionDriveQueue)
+		return remaining >= 0 && remaining < folderCount
+	}, 10*gotime.Second, gotime.Millisecond)
+	require.NoError(t, lockDB.Close())
+	select {
+	case <-stopped:
+	case <-gotime.After(10 * gotime.Second):
+		t.Fatal("the run didn't stop")
+	}
+	require.Positive(t, f.queued(repo.TrashCollectionDriveQueue))
+	gaveUp := 0
+	for _, entry := range hook.AllEntries() {
+		if entry.Message == "couldn't extend lock, stopping" {
+			gaveUp++
+		}
+	}
+	require.Equal(t, 1, gaveUp)
+}
+
+func TestPhotosEmptyTrashDoesNotDrainTheDriveQueue(t *testing.T) {
+	f := setupDriveTrashFixture(t)
+	trashed := make(map[ente.App]int64)
+	for _, app := range []ente.App{ente.Photos, ente.Drive} {
+		collectionID := f.collection(driveTrashOwner, app, "folder")
+		fileID := f.file(driveTrashOwner, app, collectionID)
+		require.NoError(t, f.ctrl.TrashRepo.TrashFiles(t.Context(), driveTrashOwner, ente.TrashRequest{
+			TrashItems: []ente.TrashItemRequest{{FileID: fileID, CollectionID: collectionID}},
+		}))
+		trashed[app] = fileID
+	}
+	require.NoError(t, f.ctrl.TrashRepo.EmptyTrash(t.Context(), driveTrashOwner, time.Microseconds(), ente.Drive))
+
+	require.NoError(t, f.ctrl.EmptyTrash(t.Context(), driveTrashOwner, ente.EmptyTrashRequest{LastUpdatedAt: time.Microseconds()}, ente.Photos))
+	require.False(t, f.inTrash(trashed[ente.Photos]))
+	require.True(t, f.inTrash(trashed[ente.Drive]))
+	require.Equal(t, 1, f.queued(repo.TrashEmptyDriveQueue))
+
+	f.ctrl.ProcessEmptyTrashRequests()
+	require.False(t, f.inTrash(trashed[ente.Drive]))
+	require.Zero(t, f.queued(repo.TrashEmptyDriveQueue))
 }
 
 func TestDriveCollectionTrashDropsLiveCollections(t *testing.T) {
@@ -468,9 +555,9 @@ func TestFileCreateIntoADeletedDriveFolderFails(t *testing.T) {
 
 func TestDriveCollectionTrashTimesOutAnItemStuckOnALock(t *testing.T) {
 	f := setupDriveTrashFixture(t)
-	previousTimeout := driveTrashItemTimeout
-	driveTrashItemTimeout = 300 * gotime.Millisecond
-	t.Cleanup(func() { driveTrashItemTimeout = previousTimeout })
+	previousTimeout := driveTrashBatchTimeout
+	driveTrashBatchTimeout = 300 * gotime.Millisecond
+	t.Cleanup(func() { driveTrashBatchTimeout = previousTimeout })
 	stuck := f.collection(driveTrashOwner, ente.Drive, "folder")
 	stuckFile := f.file(driveTrashOwner, ente.Drive, stuck)
 	other := f.collection(driveTrashOther, ente.Drive, "folder")
@@ -513,4 +600,61 @@ func TestDriveCollectionTrashTimesOutAnItemStuckOnALock(t *testing.T) {
 	f.ctrl.CleanupTrashedDriveCollections()
 	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
 	require.True(t, f.inTrash(stuckFile))
+}
+
+func TestADriveDeleteStuckOnALockDoesNotHoldUpOtherOwners(t *testing.T) {
+	f := setupDriveTrashFixture(t)
+	previousTimeout := driveTrashBatchTimeout
+	driveTrashBatchTimeout = 300 * gotime.Millisecond
+	t.Cleanup(func() { driveTrashBatchTimeout = previousTimeout })
+	stuck := f.collection(driveTrashOwner, ente.Drive, "folder")
+	stuckFile := f.file(driveTrashOwner, ente.Drive, stuck)
+	f.scheduleDrive(stuck)
+	other := f.collection(driveTrashOther, ente.Drive, "folder")
+	otherFile := f.file(driveTrashOther, ente.Drive, other)
+	f.scheduleDrive(other)
+	holder, err := f.db.Begin()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = holder.Rollback() })
+	_, err = holder.Exec(`SELECT 1 FROM files WHERE file_id = $1 FOR UPDATE`, stuckFile)
+	require.NoError(t, err)
+	// One item per run.
+	f.ctrl.driveTrashBudgetOverride = gotime.Nanosecond
+
+	for range 3 {
+		f.ctrl.CleanupTrashedDriveCollections()
+	}
+	require.True(t, f.inTrash(otherFile))
+	require.True(t, f.live(stuckFile, stuck))
+	require.Equal(t, 1, f.queued(repo.TrashCollectionDriveQueue))
+
+	require.NoError(t, holder.Rollback())
+	f.ctrl.CleanupTrashedDriveCollections()
+	require.Zero(t, f.queued(repo.TrashCollectionDriveQueue))
+	require.True(t, f.inTrash(stuckFile))
+}
+
+// Account deletion queues the same item for every app.
+func TestDriveEmptyTrashDoesNotShareTheOtherAppsLock(t *testing.T) {
+	f := setupDriveTrashFixture(t)
+	collectionID := f.collection(driveTrashOwner, ente.Drive, "folder")
+	fileID := f.file(driveTrashOwner, ente.Drive, collectionID)
+	require.NoError(t, f.ctrl.TrashRepo.TrashFiles(t.Context(), driveTrashOwner, ente.TrashRequest{
+		TrashItems: []ente.TrashItemRequest{{FileID: fileID, CollectionID: collectionID}},
+	}))
+	lastUpdatedAt := time.Microseconds()
+	for _, app := range []ente.App{ente.Photos, ente.Drive} {
+		require.NoError(t, f.ctrl.TrashRepo.EmptyTrash(t.Context(), driveTrashOwner, lastUpdatedAt, app))
+	}
+	photosLock := fmt.Sprintf("EmptyTrash:%d%s%d", driveTrashOwner, repo.EmptyTrashQueueItemSeparator, lastUpdatedAt)
+	f.holdLock(photosLock)
+
+	f.ctrl.processEmptyDriveTrashRequests()
+	require.False(t, f.inTrash(fileID))
+	require.Zero(t, f.queued(repo.TrashEmptyDriveQueue))
+	f.ctrl.processEmptyTrashRequests()
+	require.Equal(t, 1, f.queued(repo.TrashEmptyQueue))
+	f.releaseLock(photosLock)
+	f.ctrl.processEmptyTrashRequests()
+	require.Zero(t, f.queued(repo.TrashEmptyQueue))
 }

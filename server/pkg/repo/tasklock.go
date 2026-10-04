@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"context"
 	"database/sql"
 
 	"github.com/ente/museum/pkg/utils/time"
@@ -30,7 +31,11 @@ func (repo *TaskLockRepository) AcquireLock(name string, lockUntil int64, locked
 }
 
 func (repo *TaskLockRepository) ExtendLock(name string, lockUntil int64, lockedBy string) (bool, error) {
-	result, err := repo.DB.Exec(
+	return repo.ExtendLockContext(context.Background(), name, lockUntil, lockedBy)
+}
+
+func (repo *TaskLockRepository) ExtendLockContext(ctx context.Context, name string, lockUntil int64, lockedBy string) (bool, error) {
+	result, err := repo.DB.ExecContext(ctx,
 		`UPDATE task_lock SET locked_at = $1, lock_until = $2
 		 WHERE task_name = $3 AND locked_by = $4`,
 		time.Microseconds(), lockUntil, name, lockedBy)

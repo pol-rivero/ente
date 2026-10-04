@@ -8,5 +8,7 @@ CREATE TABLE IF NOT EXISTS replication_uploads (
     part_size   BIGINT NOT NULL,
     source_etag TEXT   NOT NULL,
     created_at  BIGINT NOT NULL DEFAULT now_utc_micro_seconds(),
+    -- The sweeper retries rows whose abort failed after the others.
+    abort_failed_at BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (object_key, dest_dc)
 );

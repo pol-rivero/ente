@@ -26,6 +26,7 @@ import (
 const (
 	maxCopyRequestIDLength = 64
 	maxConcurrentCopyJobs  = 2
+	maxUnfinishedCopyJobs  = 10
 	maxCopyJobAttempts     = 5
 	maxCopyJobRetryBackoff = 30 * time.Minute
 	copyJobRetention       = 7 * 24 * time.Hour
@@ -95,7 +96,6 @@ func (fc *FileCopyController) EnqueueCopy(c *gin.Context, req ente.CopyFileSyncR
 	job := repo.FileCopyJob{
 		UserID:          userID,
 		RequestID:       req.RequestID,
-		App:             ente.Drive,
 		SrcCollectionID: req.SrcCollectionID,
 		DstCollectionID: req.DstCollection,
 		Items:           items,
@@ -103,7 +103,7 @@ func (fc *FileCopyController) EnqueueCopy(c *gin.Context, req ente.CopyFileSyncR
 	objectsToReserve := fc.driveTempObjects(userID, network.GetClientInfo(c), fileCopyList)
 	err = fc.FileController.ReserveDriveUploadsWith(ctx, userID, objectsToReserve, func(ctx context.Context, tx *sql.Tx) error {
 		var err error
-		jobID, err = fc.JobRepo.InsertTx(ctx, tx, job)
+		jobID, err = fc.JobRepo.InsertTx(ctx, tx, job, maxUnfinishedCopyJobs)
 		return err
 	})
 	if err != nil {
@@ -416,7 +416,7 @@ func (fc *FileCopyController) loadCopyJob(ctx context.Context, job repo.FileCopy
 			ID: item.FileID, EncryptedKey: item.EncryptedKey, KeyDecryptionNonce: item.KeyDecryptionNonce,
 		})
 	}
-	_, objects, complete, err := fc.loadCopySources(ctx, job.UserID, job.App, req)
+	_, objects, complete, err := fc.loadCopySources(ctx, job.UserID, ente.Drive, req)
 	switch {
 	case errors.Is(err, repo.ErrFileNotInCollection) || (err == nil && !complete):
 		return nil, stacktrace.Propagate(ente.ErrNotFoundError.NewErr("a source file is no longer available"), "%v", err)

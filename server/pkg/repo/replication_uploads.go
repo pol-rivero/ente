@@ -52,13 +52,22 @@ func (repo *ReplicationUploadsRepository) ListForObject(ctx context.Context, obj
 }
 
 // Rows created before the cutoff (microseconds) whose object no longer has an
-// object_copies row.
+// object_copies row. Rows whose abort failed come last, so they can't starve
+// the others.
 func (repo *ReplicationUploadsRepository) ListAbandoned(ctx context.Context, createdBefore int64, limit int) ([]ReplicationUpload, error) {
 	return repo.list(ctx, `
 	SELECT r.object_key, r.dest_dc, r.upload_id, r.part_size, r.source_etag FROM replication_uploads r
 	WHERE r.created_at < $1
 		AND NOT EXISTS (SELECT 1 FROM object_copies c WHERE c.object_key = r.object_key)
+	ORDER BY r.abort_failed_at, r.created_at
 	LIMIT $2`, createdBefore, limit)
+}
+
+func (repo *ReplicationUploadsRepository) MarkAbortFailed(ctx context.Context, u ReplicationUpload) error {
+	_, err := repo.DB.ExecContext(ctx, `
+	UPDATE replication_uploads SET abort_failed_at = now_utc_micro_seconds()
+	WHERE object_key = $1 AND dest_dc = $2 AND upload_id = $3`, u.ObjectKey, u.DestDC, u.UploadID)
+	return stacktrace.Propagate(err, "")
 }
 
 func (repo *ReplicationUploadsRepository) list(ctx context.Context, query string, args ...any) ([]ReplicationUpload, error) {
@@ -79,18 +88,10 @@ func (repo *ReplicationUploadsRepository) list(ctx context.Context, query string
 }
 
 func (repo *ReplicationUploadsRepository) Insert(ctx context.Context, u ReplicationUpload) (bool, error) {
-	res, err := repo.DB.ExecContext(ctx, `
+	return affectsOne(repo.DB.ExecContext(ctx, `
 	INSERT INTO replication_uploads (object_key, dest_dc, upload_id, part_size, source_etag)
 	VALUES ($1, $2, $3, $4, $5)
-	ON CONFLICT (object_key, dest_dc) DO NOTHING`, u.ObjectKey, u.DestDC, u.UploadID, u.PartSize, u.SourceETag)
-	if err != nil {
-		return false, stacktrace.Propagate(err, "")
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, stacktrace.Propagate(err, "")
-	}
-	return n == 1, nil
+	ON CONFLICT (object_key, dest_dc) DO NOTHING`, u.ObjectKey, u.DestDC, u.UploadID, u.PartSize, u.SourceETag))
 }
 
 func (repo *ReplicationUploadsRepository) Delete(ctx context.Context, objectKey string, destDC string, uploadID string) error {

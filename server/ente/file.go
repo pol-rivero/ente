@@ -168,6 +168,19 @@ type MultipartUploadResume struct {
 	CompleteURL    string                `json:"completeURL"`
 }
 
+type PendingUpload struct {
+	ObjectKey     string `json:"objectKey"`
+	ContentLength int64  `json:"contentLength"`
+	IsMultipart   bool   `json:"isMultipart"`
+	CreatedAt     int64  `json:"createdAt"`
+	ExpiresAt     int64  `json:"expiresAt"`
+}
+
+type PendingUploads struct {
+	Uploads []PendingUpload `json:"uploads"`
+	HasMore bool            `json:"hasMore"`
+}
+
 type MultipartUploadURLRequest struct {
 	ContentLength int64    `json:"contentLength" binding:"required"`
 	PartLength    int64    `json:"partLength" binding:"required"`
@@ -221,6 +234,8 @@ type TempObject struct {
 	PartLength          *int64
 	Client              string
 	ReservationReleased bool
+	// Reserved by a Drive copy, not by a client upload.
+	IsCopy bool
 }
 
 type DuplicateFiles struct {

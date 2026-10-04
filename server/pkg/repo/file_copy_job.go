@@ -12,8 +12,6 @@ import (
 	"github.com/lib/pq"
 )
 
-var ErrFileCopyJobExists = errors.New("a copy job with this request ID already exists")
-
 type FileCopyJobRepository struct {
 	DB                *sql.DB
 	ObjectCleanupRepo *ObjectCleanupRepository
@@ -23,7 +21,6 @@ type FileCopyJob struct {
 	ID              int64
 	UserID          int64
 	RequestID       string
-	App             ente.App
 	SrcCollectionID int64
 	DstCollectionID int64
 	Items           json.RawMessage
@@ -37,17 +34,24 @@ type FileCopyJob struct {
 	LeaseStart time.Time
 }
 
-func (r *FileCopyJobRepository) InsertTx(ctx context.Context, tx *sql.Tx, job FileCopyJob) (int64, error) {
-	var id int64
+// Callers hold the user's quota lock, so concurrent enqueues can't both pass the cap.
+func (r *FileCopyJobRepository) InsertTx(ctx context.Context, tx *sql.Tx, job FileCopyJob, maxUnfinished int) (int64, error) {
+	var unfinished int
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO file_copy_jobs (user_id, request_id, app, src_collection_id, dst_collection_id, items)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (user_id, request_id) DO NOTHING
-		RETURNING id`,
-		job.UserID, job.RequestID, job.App, job.SrcCollectionID, job.DstCollectionID, []byte(job.Items)).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, stacktrace.Propagate(ErrFileCopyJobExists, "")
+		SELECT COUNT(*) FROM file_copy_jobs WHERE user_id = $1 AND status IN ('pending', 'running')`,
+		job.UserID).Scan(&unfinished)
+	if err != nil {
+		return 0, stacktrace.Propagate(err, "")
 	}
+	if unfinished >= maxUnfinished {
+		return 0, stacktrace.Propagate(ente.ErrTooManyCopyJobs, "%d unfinished copy jobs", unfinished)
+	}
+	var id int64
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO file_copy_jobs (user_id, request_id, src_collection_id, dst_collection_id, items)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id`,
+		job.UserID, job.RequestID, job.SrcCollectionID, job.DstCollectionID, []byte(job.Items)).Scan(&id)
 	return id, stacktrace.Propagate(err, "")
 }
 
@@ -83,12 +87,35 @@ func (r *FileCopyJobRepository) Get(ctx context.Context, id int64, userID int64)
 // lease. A user with a job under a live lease waits, so one backlog can't
 // take every worker.
 func (r *FileCopyJobRepository) Claim(ctx context.Context, leaseToken string, lease time.Duration) (*FileCopyJob, error) {
-	job := FileCopyJob{Status: ente.CopyJobRunning, LeaseToken: leaseToken, LeaseStart: time.Now()}
+	leaseStart := time.Now()
+	tx, err := r.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	defer tx.Rollback()
+	job, err := r.claimTx(ctx, tx, leaseToken, lease)
+	if err != nil || job == nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	job.LeaseStart = leaseStart
+	return job, nil
+}
+
+// Claims are serialized: the NOT EXISTS can't see another pod's uncommitted
+// claim, and SKIP LOCKED skips its row, so two jobs of one user could run.
+func (r *FileCopyJobRepository) claimTx(ctx context.Context, tx *sql.Tx, leaseToken string, lease time.Duration) (*FileCopyJob, error) {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('file_copy_jobs_claim', 0))`); err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	job := FileCopyJob{Status: ente.CopyJobRunning, LeaseToken: leaseToken}
 	var items []byte
-	err := r.DB.QueryRowContext(ctx, `
+	err := tx.QueryRowContext(ctx, `
 		UPDATE file_copy_jobs
 		SET status = 'running', claims = claims + 1, attempts = attempts + 1, lease_token = $1,
-		    lease_until = now_utc_micro_seconds() + $2
+			lease_until = now_utc_micro_seconds() + $2
 		WHERE id = (
 			SELECT j.id FROM file_copy_jobs j
 			WHERE j.status IN ('pending', 'running') AND COALESCE(j.lease_until, 0) < now_utc_micro_seconds()
@@ -98,9 +125,9 @@ func (r *FileCopyJobRepository) Claim(ctx context.Context, leaseToken string, le
 			ORDER BY j.id
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED)
-		RETURNING id, user_id, request_id, app, src_collection_id, dst_collection_id, items, claims, attempts`,
+		RETURNING id, user_id, request_id, src_collection_id, dst_collection_id, items, claims, attempts`,
 		leaseToken, lease.Microseconds()).
-		Scan(&job.ID, &job.UserID, &job.RequestID, &job.App, &job.SrcCollectionID, &job.DstCollectionID, &items,
+		Scan(&job.ID, &job.UserID, &job.RequestID, &job.SrcCollectionID, &job.DstCollectionID, &items,
 			&job.Claims, &job.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

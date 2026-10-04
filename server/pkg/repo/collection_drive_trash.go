@@ -3,6 +3,7 @@ package repo
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	gTime "time"
 
@@ -15,66 +16,84 @@ import (
 
 const driveTrashTreeLockTimeout = 30 * gTime.Second
 
+var ErrDriveTrashBatchTimeout = errors.New("timed out trashing a batch of a Drive collection")
+
 // Like TrashV3, except that an owner file that is still in another live
 // collection of the owner is only removed from this one. Collections deleted
 // together are all marked deleted before any of them gets here, so they
 // don't keep each other's files alive.
-func (repo *CollectionRepository) TrashDriveCollection(ctx context.Context, collectionID int64, ownerID int64) error {
+//
+// Returns false if it stopped at yieldAt. Each batch commits, so the next call
+// resumes where this one stopped.
+func (repo *CollectionRepository) TrashDriveCollection(ctx context.Context, collectionID int64, ownerID int64, yieldAt gTime.Time, batchTimeout gTime.Duration) (bool, error) {
 	log := logrus.WithFields(logrus.Fields{
 		"deleting_collection": collectionID,
 	})
-	if err := repo.reRootLiveChildren(ctx, collectionID, ownerID, log); err != nil {
-		return stacktrace.Propagate(err, "")
+	err := withBatchTimeout(ctx, batchTimeout, func(ctx context.Context) error {
+		return repo.reRootLiveChildren(ctx, collectionID, ownerID, log)
+	})
+	if err != nil {
+		return false, stacktrace.Propagate(err, "")
 	}
 	fileIDs, err := repo.GetCollectionFileIDs(collectionID, ownerID)
 	if err != nil {
-		log.WithError(err).Error("failed to get fileIDs")
-		return stacktrace.Propagate(err, "")
+		return false, stacktrace.Propagate(err, "failed to get fileIDs")
 	}
 	log.WithField("file_count", len(fileIDs)).Debug("Fetched fileIDs")
 	batchSize := 2000
 	for i := 0; i < len(fileIDs); i += batchSize {
-		batch := fileIDs[i:min(i+batchSize, len(fileIDs))]
-		if err := repo.FileRepo.VerifyFileOwner(ctx, batch, ownerID, log); err != nil {
-			return stacktrace.Propagate(err, "")
+		if i > 0 && gTime.Now().After(yieldAt) {
+			return false, nil
 		}
-		if err := repo.trashOrUnlinkDriveFiles(ctx, collectionID, ownerID, batch); err != nil {
-			log.WithError(err).Error("failed to trash file")
-			return stacktrace.Propagate(err, "")
+		batch := fileIDs[i:min(i+batchSize, len(fileIDs))]
+		err := withBatchTimeout(ctx, batchTimeout, func(ctx context.Context) error {
+			if err := repo.FileRepo.VerifyFileOwner(ctx, batch, ownerID, log); err != nil {
+				return stacktrace.Propagate(err, "")
+			}
+			return stacktrace.Propagate(repo.trashOrUnlinkDriveFiles(ctx, collectionID, ownerID, batch), "failed to trash files")
+		})
+		if err != nil {
+			return false, stacktrace.Propagate(err, "")
 		}
 	}
 	count, err := repo.GetCollectionsFilesCount(collectionID)
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return false, stacktrace.Propagate(err, "")
 	}
 	if count != 0 {
 		removedFiles, removeErr := repo.removeAllFilesAddedByOthers(collectionID, ownerID)
 		if removeErr != nil {
-			return stacktrace.Propagate(removeErr, "")
+			return false, stacktrace.Propagate(removeErr, "")
 		}
 		if count != removedFiles {
-			return fmt.Errorf("investigate: collection %d still has %d files which are not deleted", collectionID, count-removedFiles)
+			return false, fmt.Errorf("investigate: collection %d still has %d files which are not deleted", collectionID, count-removedFiles)
 		}
 		log.WithField("file_count", count).
 			WithField("removed_files", removedFiles).
 			Debug("All files are removed from the collection")
 	}
-	return nil
+	return true, nil
+}
+
+func withBatchTimeout(ctx context.Context, timeout gTime.Duration, fn func(ctx context.Context) error) error {
+	batchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := fn(batchCtx)
+	if err != nil && ctx.Err() == nil && errors.Is(batchCtx.Err(), context.DeadlineExceeded) {
+		return stacktrace.Propagate(ErrDriveTrashBatchTimeout, "%v", err)
+	}
+	return err
 }
 
 // Nothing can add a child to a deleted folder, so the unlocked check can't
 // miss one.
 func (repo *CollectionRepository) reRootLiveChildren(ctx context.Context, collectionID, ownerID int64, log *logrus.Entry) error {
-	var hasLiveChildren bool
-	if err := repo.DB.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM collections WHERE parent_id = $1 AND NOT is_deleted)`,
-		collectionID).Scan(&hasLiveChildren); err != nil {
+	hasChildren, err := hasLiveChildren(ctx, repo.DB, ownerID, collectionID)
+	if err != nil || !hasChildren {
 		return stacktrace.Propagate(err, "")
 	}
-	if !hasLiveChildren {
-		return nil
-	}
 	return repo.InCollectionTreeTx(ctx, ownerID, driveTrashTreeLockTimeout, func(tx *sql.Tx) error {
-		count, err := repo.ReRootLiveChildrenTx(ctx, tx, collectionID, time.Microseconds())
+		count, err := repo.ReRootLiveChildrenTx(ctx, tx, ownerID, collectionID, time.Microseconds())
 		if err != nil {
 			return stacktrace.Propagate(err, "")
 		}

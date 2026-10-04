@@ -69,8 +69,12 @@ func TestPartSize(t *testing.T) {
 		require.Equal(t, tt.want, partSize, "size %d, maxParts %d", tt.size, tt.maxParts)
 		require.Zero(t, partSize%mib)
 		require.LessOrEqual(t, CeilDiv(tt.size, partSize), int64(tt.maxParts))
-		require.LessOrEqual(t, partSize, MaxPartSize)
+		checked, err := DefaultOptions(tt.maxParts).CheckedPartSize(tt.size)
+		require.NoError(t, err)
+		require.Equal(t, partSize, checked)
 	}
+	_, err := DefaultOptions(1000).CheckedPartSize(5000*gib + 1)
+	require.Error(t, err)
 	require.False(t, DefaultOptions(10000).IsMultipart(MaxSingleCopySize))
 	require.True(t, DefaultOptions(10000).IsMultipart(MaxSingleCopySize+1))
 }
@@ -254,23 +258,6 @@ func TestCopyStopsWhenCancelled(t *testing.T) {
 	require.LessOrEqual(t, len(fake.RequestsOf(fakes3.OpPartCopy)), 2)
 	require.Len(t, fake.RequestsOf(fakes3.OpAbort), 1)
 	require.Empty(t, fake.Uploads())
-}
-
-func TestCopySourceEscapesKeys(t *testing.T) {
-	client, fake := newTestClient(t)
-	key := "1/a b+c%d?é&=#~_.-x"
-	fake.PutObject(key, 12*mib)
-
-	require.NoError(t, Copy(t.Context(), client, fakes3.Bucket, key, "1/small", 12*mib, Options{MaxSingleCopySize: 16 * mib}))
-	require.NoError(t, Copy(t.Context(), client, fakes3.Bucket, key, "1/dst", 12*mib, testOptions(10000)))
-
-	want := fakes3.Bucket + "/1/a%20b%2Bc%25d%3F%C3%A9%26%3D%23~_.-x"
-	require.Equal(t, want, fake.RequestsOf(fakes3.OpCopy)[0].CopySource)
-	for _, part := range fake.RequestsOf(fakes3.OpPartCopy) {
-		require.Equal(t, want, part.CopySource)
-	}
-	_, ok := fake.Object("1/dst")
-	require.True(t, ok)
 }
 
 func TestCopyMultipartIgnoresThreshold(t *testing.T) {

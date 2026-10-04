@@ -56,7 +56,7 @@ func (c *CollectionController) TrashV4(ctx context.Context, userID int64, cID in
 			}).Warning("Collection is already deleted")
 			return nil
 		}
-		ids, err := c.liveCollectionsToDelete(ctx, tx, cID, keepFiles, recursive)
+		ids, err := c.liveCollectionsToDelete(ctx, tx, userID, cID, keepFiles, recursive)
 		if err != nil {
 			return stacktrace.Propagate(err, "")
 		}
@@ -80,11 +80,11 @@ func (c *CollectionController) TrashV4(ctx context.Context, userID int64, cID in
 	return nil
 }
 
-func (c *CollectionController) liveCollectionsToDelete(ctx context.Context, tx *sql.Tx, cID int64, keepFiles bool, recursive bool) ([]int64, error) {
+func (c *CollectionController) liveCollectionsToDelete(ctx context.Context, tx *sql.Tx, ownerID, cID int64, keepFiles bool, recursive bool) ([]int64, error) {
 	ids := []int64{cID}
 	if recursive {
 		limit := maxRecursiveDelete()
-		subtree, err := c.CollectionRepo.GetLiveSubtreeIDsTx(ctx, tx, cID, limit+1)
+		subtree, err := c.CollectionRepo.GetLiveSubtreeIDsTx(ctx, tx, ownerID, cID, limit+1)
 		if err != nil {
 			return nil, stacktrace.Propagate(err, "")
 		}
@@ -108,11 +108,11 @@ func (c *CollectionController) liveCollectionsToDelete(ctx context.Context, tx *
 		}
 	}
 	if !recursive {
-		subtree, err := c.CollectionRepo.GetLiveSubtreeIDsTx(ctx, tx, cID, 2)
+		hasChildren, err := c.CollectionRepo.HasLiveChildrenTx(ctx, tx, ownerID, cID)
 		if err != nil {
 			return nil, stacktrace.Propagate(err, "")
 		}
-		if len(subtree) > 1 {
+		if hasChildren {
 			return nil, stacktrace.Propagate(ente.ErrHasChildren, "collection %d", cID)
 		}
 	}

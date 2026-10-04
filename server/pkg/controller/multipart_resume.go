@@ -23,27 +23,29 @@ const maxResumableUploadAge = 90 * 24 * gTime.Hour
 
 const completedUploadMinValidity = 7 * 24 * gTime.Hour
 
-// The S3 client has no timeout, and resume holds a pooled DB connection and the
-// row lock while it talks to S3.
+// The S3 client has no timeout.
 const multipartUploadStorageTimeout = 60 * gTime.Second
+
+// Resumed URLs expire before the row, so a part PUT started just before they
+// expire can finish before the cron aborts the upload.
+const (
+	resumeURLExpiryMargin = gTime.Hour
+	minResumeURLValidity  = 5 * gTime.Minute
+)
 
 // A gone verdict lets the cron delete the object, so don't trust a 404 HEAD
 // right after a slow CompleteMultipartUpload.
 var headNotFoundRetryDelays = []gTime.Duration{500 * gTime.Millisecond, 1500 * gTime.Millisecond}
 
+// No transaction is held across S3 calls: the row is re-checked by the
+// conditional updates instead.
 func (c *FileController) ResumeMultipartUpload(ctx context.Context, userID int64, objectKey string) (ente.MultipartUploadResume, error) {
 	if err := requireOwnObjectKey(userID, objectKey); err != nil {
 		return ente.MultipartUploadResume{}, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, multipartUploadStorageTimeout)
 	defer cancel()
-	tx, err := c.ObjectCleanupRepo.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
-	}
-	defer tx.Rollback()
-	now := time.Microseconds()
-	upload, err := c.lockOwnedDriveUpload(ctx, tx, userID, objectKey, now)
+	upload, err := c.readOwnedDriveUpload(ctx, userID, objectKey, false)
 	if err != nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 	}
@@ -57,10 +59,10 @@ func (c *FileController) ResumeMultipartUpload(ctx context.Context, userID int64
 	if upload.ContentLength == nil || upload.PartLength == nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.NewBadRequestWithMessage("upload is not resumable"), "")
 	}
-	dc := c.uploadDataCenter(upload)
+	dc := upload.BucketId
 	parts, err := c.listUploadedParts(ctx, dc, objectKey, upload.UploadID)
 	if err != nil && isUnknownUploadError(err) {
-		return c.resumeAssembledUpload(ctx, tx, upload, dc, now)
+		return c.resumeAssembledUpload(ctx, upload)
 	}
 	if err != nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
@@ -76,56 +78,98 @@ func (c *FileController) ResumeMultipartUpload(ctx context.Context, userID int64
 			uploaded[part.PartNumber] = true
 		}
 	}
+	expiry := upload.ExpirationTime
+	now := time.Microseconds()
+	progressed := false
+	if completed := int64(len(resume.CompletedParts)); completed > upload.ResumePartsCompleted {
+		var found bool
+		expiry, found, err = c.ObjectCleanupRepo.ExtendLiveUploadExpiry(ctx, objectKey, upload.UploadID, now,
+			now+2*PreSignedPartUploadRequestDuration.Microseconds(), maxResumableUploadAge.Microseconds(), &completed)
+		if err != nil {
+			return ente.MultipartUploadResume{}, uploadBusyIfLocked(err)
+		}
+		if !found {
+			return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadGone, "")
+		}
+		progressed = true
+	}
+	validity := resumeURLValidity(expiry, now)
+	if validity <= 0 {
+		// The row expires too soon for URLs that end well before it.
+		if err := c.ObjectCleanupRepo.ExpireLiveUpload(ctx, objectKey, upload.UploadID, upload.UserID, time.Microseconds()); err != nil {
+			return ente.MultipartUploadResume{}, uploadBusyIfLocked(err)
+		}
+		return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadGone, "")
+	}
 	for i, length := range lengths {
 		partNumber := int64(i + 1)
 		if uploaded[partNumber] {
 			continue
 		}
-		url, err := c.getPartURL(dc, objectKey, partNumber, &upload.UploadID, &length, nil)
+		url, err := c.getPartURL(dc, objectKey, partNumber, &upload.UploadID, &length, nil, validity)
 		if err != nil {
 			return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 		}
 		resume.PartURLs[partNumber] = url
 	}
-	resume.CompleteURL, err = c.getCompleteURL(dc, objectKey, &upload.UploadID)
+	resume.CompleteURL, err = c.getCompleteURL(dc, objectKey, &upload.UploadID, validity)
 	if err != nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 	}
-	if completed := int64(len(resume.CompletedParts)); completed > upload.ResumePartsCompleted {
-		expiry := now + 2*PreSignedPartUploadRequestDuration.Microseconds()
-		if err := c.ObjectCleanupRepo.ExtendTempObjectExpiry(ctx, tx, objectKey, expiry, maxResumableUploadAge.Microseconds(), &completed); err != nil {
+	if !progressed {
+		// The expiry was read before ListParts; an abort, commit or the cron
+		// may have released the row since.
+		live, err := c.ObjectCleanupRepo.IsLiveUpload(ctx, objectKey, upload.UploadID, time.Microseconds())
+		if err != nil {
 			return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
+		if !live {
+			return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadGone, "")
+		}
 	}
 	return resume, nil
 }
 
+// Expiry only moves on progress, so URLs from a resume without progress may
+// be valid for less than the usual 7 days. Zero if the row expires too soon.
+func resumeURLValidity(expiry int64, now int64) gTime.Duration {
+	remaining := gTime.Duration(expiry-now) * gTime.Microsecond
+	validity := min(PreSignedPartUploadRequestDuration, remaining-resumeURLExpiryMargin)
+	if validity < minResumeURLValidity {
+		return 0
+	}
+	return validity
+}
+
+func uploadBusyIfLocked(err error) error {
+	if errors.Is(err, repo.ErrTempObjectLocked) {
+		return stacktrace.Propagate(ente.ErrUploadBusy, "")
+	}
+	return stacktrace.Propagate(err, "")
+}
+
 // The client may have completed the upload and lost the response.
-func (c *FileController) resumeAssembledUpload(ctx context.Context, tx *sql.Tx, upload repo.LockedTempObject, dc string, now int64) (ente.MultipartUploadResume, error) {
-	size, found, err := c.headObject(ctx, dc, upload.ObjectKey)
+func (c *FileController) resumeAssembledUpload(ctx context.Context, upload repo.LockedTempObject) (ente.MultipartUploadResume, error) {
+	size, found, err := c.headObject(ctx, upload.BucketId, upload.ObjectKey)
 	if err != nil {
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
 	}
 	if !found || size != *upload.ContentLength {
 		// Neither can ever be committed: expire now so the cron deletes any
 		// stray object and the reservation is released.
-		if err := c.ObjectCleanupRepo.ExpireLockedTempObject(ctx, tx, upload.ObjectKey, upload.UserID, now); err != nil {
-			return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
-		}
-		if err := tx.Commit(); err != nil {
-			return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
+		if err := c.ObjectCleanupRepo.ExpireLiveUpload(ctx, upload.ObjectKey, upload.UploadID, upload.UserID, time.Microseconds()); err != nil {
+			return ente.MultipartUploadResume{}, uploadBusyIfLocked(err)
 		}
 		return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadGone, "found=%t size=%d", found, size)
 	}
-	expiry := now + completedUploadMinValidity.Microseconds()
-	if err := c.ObjectCleanupRepo.ExtendTempObjectExpiry(ctx, tx, upload.ObjectKey, expiry, maxResumableUploadAge.Microseconds(), nil); err != nil {
-		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
+	now := time.Microseconds()
+	_, found, err = c.ObjectCleanupRepo.ExtendLiveUploadExpiry(ctx, upload.ObjectKey, upload.UploadID, now,
+		now+completedUploadMinValidity.Microseconds(), maxResumableUploadAge.Microseconds(), nil)
+	if err != nil {
+		return ente.MultipartUploadResume{}, uploadBusyIfLocked(err)
 	}
-	if err := tx.Commit(); err != nil {
-		return ente.MultipartUploadResume{}, stacktrace.Propagate(err, "")
+	if !found {
+		return ente.MultipartUploadResume{}, stacktrace.Propagate(ente.ErrUploadGone, "")
 	}
 	return ente.MultipartUploadResume{Completed: true}, nil
 }
@@ -138,7 +182,7 @@ func (c *FileController) AbortMultipartUpload(ctx context.Context, userID int64,
 	if err := requireOwnObjectKey(userID, objectKey); err != nil {
 		return err
 	}
-	upload, err := c.expireOwnedDriveUpload(ctx, userID, objectKey)
+	upload, err := c.readOwnedDriveUpload(ctx, userID, objectKey, true)
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
@@ -149,13 +193,15 @@ func (c *FileController) AbortMultipartUpload(ctx context.Context, userID int64,
 	// upload if this fails or the client disconnects.
 	ctx, cancel := context.WithTimeout(ctx, multipartUploadStorageTimeout)
 	defer cancel()
-	if err := c.ObjectCleanupCtrl.AbortMultipartUploadWithContext(ctx, objectKey, upload.UploadID, c.uploadDataCenter(upload)); err != nil {
+	if err := c.ObjectCleanupCtrl.AbortMultipartUploadWithContext(ctx, objectKey, upload.UploadID, upload.BucketId); err != nil {
 		log.WithError(err).WithField("object_key", objectKey).Warn("Failed to abort multipart upload, leaving it to the cleanup cron")
 	}
 	return nil
 }
 
-func (c *FileController) expireOwnedDriveUpload(ctx context.Context, userID int64, objectKey string) (repo.LockedTempObject, error) {
+// The row lock only detects a concurrent resume, abort or Create (409); it is
+// released before any S3 call.
+func (c *FileController) readOwnedDriveUpload(ctx context.Context, userID int64, objectKey string, expire bool) (repo.LockedTempObject, error) {
 	tx, err := c.ObjectCleanupRepo.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return repo.LockedTempObject{}, stacktrace.Propagate(err, "")
@@ -166,10 +212,26 @@ func (c *FileController) expireOwnedDriveUpload(ctx context.Context, userID int6
 	if err != nil {
 		return upload, stacktrace.Propagate(err, "")
 	}
-	if err := c.ObjectCleanupRepo.ExpireLockedTempObject(ctx, tx, objectKey, userID, now); err != nil {
-		return upload, stacktrace.Propagate(err, "")
+	if expire {
+		if err := c.ObjectCleanupRepo.ExpireLockedTempObject(ctx, tx, objectKey, userID, now); err != nil {
+			return upload, stacktrace.Propagate(err, "")
+		}
 	}
 	return upload, stacktrace.Propagate(tx.Commit(), "")
+}
+
+var pendingUploadsPageSize = 1000
+
+func (c *FileController) GetPendingDriveUploads(ctx context.Context, userID int64, afterKey string) (ente.PendingUploads, error) {
+	uploads, err := c.ObjectCleanupRepo.GetLiveDriveReservations(ctx, userID, time.Microseconds(), afterKey, pendingUploadsPageSize+1)
+	if err != nil {
+		return ente.PendingUploads{}, stacktrace.Propagate(err, "")
+	}
+	hasMore := len(uploads) > pendingUploadsPageSize
+	if hasMore {
+		uploads = uploads[:pendingUploadsPageSize]
+	}
+	return ente.PendingUploads{Uploads: uploads, HasMore: hasMore}, nil
 }
 
 // Never lock rows outside the caller's key prefix: that could make the owner's
@@ -192,7 +254,7 @@ func (c *FileController) lockOwnedDriveUpload(ctx context.Context, tx *sql.Tx, u
 	if err != nil {
 		return upload, stacktrace.Propagate(err, "")
 	}
-	if upload.UserID != userID {
+	if upload.UserID != userID || upload.IsCopy {
 		return upload, stacktrace.Propagate(&ente.ErrNotFoundError, "")
 	}
 	if upload.App != ente.Drive || upload.Purpose != "file_upload" {
@@ -203,13 +265,6 @@ func (c *FileController) lockOwnedDriveUpload(ctx context.Context, tx *sql.Tx, u
 
 func notDriveMultipartUpload() error {
 	return ente.NewBadRequestWithMessage("not a Drive multipart upload")
-}
-
-func (c *FileController) uploadDataCenter(upload repo.LockedTempObject) string {
-	if upload.BucketId == "" {
-		return c.S3Config.GetHotDataCenter()
-	}
-	return upload.BucketId
 }
 
 func (c *FileController) listUploadedParts(ctx context.Context, dc string, objectKey string, uploadID string) ([]ente.MultipartUploadPart, error) {

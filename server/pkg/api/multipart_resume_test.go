@@ -1,8 +1,11 @@
 package api
 
 import (
+	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -70,6 +73,7 @@ func TestMultipartResumeAndAbortRoutes(t *testing.T) {
 	router := gin.New()
 	router.POST("/files/multipart-upload-url/resume", h.ResumeMultipartUpload)
 	router.DELETE("/files/multipart-upload", h.AbortMultipartUpload)
+	router.GET("/files/uploads", h.GetPendingUploads)
 	serve := func(method, target, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, target, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -108,9 +112,38 @@ func TestMultipartResumeAndAbortRoutes(t *testing.T) {
 		require.JSONEq(t, tt.wantBody, recorder.Body.String(), "%+v", tt)
 	}
 
+	listed := serve(http.MethodGet, "/files/uploads", "")
+	require.Equal(t, http.StatusOK, listed.Code, listed.Body.String())
+	var pending struct {
+		Uploads []map[string]any `json:"uploads"`
+		HasMore *bool            `json:"hasMore"`
+	}
+	require.NoError(t, json.Unmarshal(listed.Body.Bytes(), &pending))
+	require.NotNil(t, pending.HasMore)
+	require.False(t, *pending.HasMore)
+	require.Len(t, pending.Uploads, 2)
+	for i, key := range []string{"1/assembled", "1/in-progress"} {
+		upload := pending.Uploads[i]
+		require.ElementsMatch(t, []string{"objectKey", "contentLength", "isMultipart", "createdAt", "expiresAt"}, slices.Collect(maps.Keys(upload)))
+		require.Equal(t, key, upload["objectKey"])
+		require.EqualValues(t, 12, upload["contentLength"])
+		require.Equal(t, true, upload["isMultipart"])
+		var expiresAt int64
+		require.NoError(t, db.QueryRow(`SELECT expiration_time FROM temp_objects WHERE object_key = $1`, key).Scan(&expiresAt))
+		require.EqualValues(t, expiresAt, upload["expiresAt"])
+		require.Positive(t, upload["createdAt"])
+	}
+	listed = serve(http.MethodGet, "/files/uploads?after=1/assembled", "")
+	require.Equal(t, http.StatusOK, listed.Code, listed.Body.String())
+	require.Contains(t, listed.Body.String(), `"objectKey":"1/in-progress"`)
+	require.NotContains(t, listed.Body.String(), `"objectKey":"1/assembled"`)
+
 	abort := serve(http.MethodDelete, "/files/multipart-upload?objectKey=1/in-progress", "")
 	require.Equal(t, http.StatusOK, abort.Code, abort.Body.String())
 	require.True(t, aborted.Load())
 	gone := serve(http.MethodPost, "/files/multipart-upload-url/resume", `{"objectKey":"1/in-progress"}`)
 	require.Equal(t, http.StatusGone, gone.Code)
+	listed = serve(http.MethodGet, "/files/uploads", "")
+	require.Equal(t, http.StatusOK, listed.Code, listed.Body.String())
+	require.NotContains(t, listed.Body.String(), `"objectKey":"1/in-progress"`)
 }

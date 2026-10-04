@@ -207,6 +207,34 @@ func TestAsyncCopyValidatesBeforeEnqueueing(t *testing.T) {
 	require.Zero(t, f.tempRowCount())
 }
 
+func TestAsyncCopyCapsUnfinishedJobsPerUser(t *testing.T) {
+	f := setupCopyTest(t, ente.Drive, 100*gib)
+	fileID := f.addSourceFile(ente.Drive, 3*mib, 1000)
+	var first int64
+	for i := range maxUnfinishedCopyJobs {
+		jobID, err := f.enqueue(fmt.Sprint("request-", i), fileID)
+		require.NoError(t, err)
+		if i == 0 {
+			first = jobID
+		}
+	}
+	_, err := f.db.Exec(`UPDATE file_copy_jobs SET status = 'running' WHERE id = $1`, first)
+	require.NoError(t, err)
+
+	_, err = f.enqueue("over-the-cap", fileID)
+	requireAPIErrorCode(t, err, http.StatusTooManyRequests, ente.TooManyCopyJobs)
+	require.Equal(t, maxUnfinishedCopyJobs, f.jobCount())
+	require.Equal(t, 2*maxUnfinishedCopyJobs, f.tempRowCount())
+	retried, err := f.enqueue("request-0", fileID)
+	require.NoError(t, err)
+	require.Equal(t, first, retried)
+
+	_, err = f.db.Exec(`UPDATE file_copy_jobs SET status = 'completed' WHERE id = $1`, first)
+	require.NoError(t, err)
+	_, err = f.enqueue("over-the-cap", fileID)
+	require.NoError(t, err)
+}
+
 func TestCopyJobCompletes(t *testing.T) {
 	lowerCopyThresholds(t)
 	f := setupCopyTest(t, ente.Drive, 100*gib)
@@ -505,8 +533,8 @@ func TestInterruptedCopyJobGoesBackToTheQueue(t *testing.T) {
 func TestCopyJobsOfAUserDontBlockOtherUsers(t *testing.T) {
 	f := setupCopyTest(t, ente.Drive, 100*gib)
 	for i, userID := range []int64{actorID, actorID, sharerID} {
-		_, err := f.db.Exec(`INSERT INTO file_copy_jobs (user_id, request_id, app, src_collection_id, dst_collection_id, items)
-			VALUES ($1, $2, 'drive', 1, 2, '[]')`, userID, fmt.Sprint(i))
+		_, err := f.db.Exec(`INSERT INTO file_copy_jobs (user_id, request_id, src_collection_id, dst_collection_id, items)
+			VALUES ($1, $2, 1, 2, '[]')`, userID, fmt.Sprint(i))
 		require.NoError(t, err)
 	}
 
@@ -537,8 +565,8 @@ func TestFinishedCopyJobsAreDeletedAfterRetention(t *testing.T) {
 	f := setupCopyTest(t, ente.Drive, 100*gib)
 	old := time.Microseconds() - copyJobRetention.Microseconds() - 1
 	insert := func(requestID string, status ente.CopyJobStatus, updatedAt int64) {
-		_, err := f.db.Exec(`INSERT INTO file_copy_jobs (user_id, request_id, app, src_collection_id, dst_collection_id, items, status, updated_at)
-			VALUES ($1, $2, 'drive', 1, 2, '[]', $3, $4)`, actorID, requestID, status, updatedAt)
+		_, err := f.db.Exec(`INSERT INTO file_copy_jobs (user_id, request_id, src_collection_id, dst_collection_id, items, status, updated_at)
+			VALUES ($1, $2, 1, 2, '[]', $3, $4)`, actorID, requestID, status, updatedAt)
 		require.NoError(t, err)
 	}
 	for i, status := range []ente.CopyJobStatus{ente.CopyJobPending, ente.CopyJobRunning, ente.CopyJobCompleted, ente.CopyJobFailed} {
@@ -558,4 +586,75 @@ func TestFinishedCopyJobsAreDeletedAfterRetention(t *testing.T) {
 		remaining = append(remaining, requestID)
 	}
 	require.Equal(t, []string{"0", "1", "recent"}, remaining)
+}
+
+// The client lists its pending uploads to resume or abort them; a copy's
+// reservations must not be among them.
+func (f *copyFixture) requireNotTheClientsUploads(keys ...string) {
+	f.t.Helper()
+	ctx := context.Background()
+	pending, err := f.ctrl.FileController.GetPendingDriveUploads(ctx, actorID, "")
+	require.NoError(f.t, err)
+	require.Empty(f.t, pending.Uploads)
+	for _, key := range keys {
+		before, err := f.tempRow(key)
+		require.NoError(f.t, err)
+		_, err = f.ctrl.FileController.ResumeMultipartUpload(ctx, actorID, key)
+		requireAPIErrorCode(f.t, err, http.StatusNotFound, ente.NotFoundError)
+		err = f.ctrl.FileController.AbortMultipartUpload(ctx, actorID, key)
+		requireAPIErrorCode(f.t, err, http.StatusNotFound, ente.NotFoundError)
+		after, err := f.tempRow(key)
+		require.NoError(f.t, err)
+		require.Equal(f.t, before, after, key)
+	}
+}
+
+func TestCopyReservationsAreNotTheClientsUploads(t *testing.T) {
+	lowerCopyThresholds(t)
+	f := setupCopyTest(t, ente.Drive, 100*gib)
+	small := f.addSourceFile(ente.Drive, 3*mib, 1000)
+	large := f.addSourceFile(ente.Drive, 22*mib, 1000)
+	jobID := f.mustEnqueue(small, large)
+	var keys []string
+	for _, fileID := range []int64{small, large} {
+		item := f.jobItem(jobID, fileID)
+		keys = append(keys, item.FileObjectKey, item.ThumbObjectKey)
+	}
+	largeKey := f.jobItem(jobID, large).FileObjectKey
+	f.requireNotTheClientsUploads(keys...)
+
+	var once sync.Once
+	f.fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == fakes3.OpPartCopy && r.Key == largeKey {
+			once.Do(func() {
+				row, err := f.tempRow(largeKey)
+				require.NoError(t, err)
+				require.True(t, row.uploadID.Valid)
+				f.requireNotTheClientsUploads(largeKey)
+			})
+		}
+		return nil
+	})
+	f.runNextJob()
+	f.fake.SetHook(nil)
+
+	status := f.jobStatus(jobID)
+	require.Equal(t, ente.CopyJobCompleted, status.Status)
+	require.Len(t, status.OldToNewFileIDMap, 2)
+	require.Equal(t, 2, f.actorFileCount())
+	require.Empty(t, f.fake.Uploads())
+	require.Empty(t, f.fake.RequestsOf(fakes3.OpAbort))
+
+	syncSource := f.addSourceFile(ente.Drive, 22*mib, 1000)
+	var syncOnce sync.Once
+	f.fake.SetHook(func(r fakes3.Request) *fakes3.Failure {
+		if r.Op == fakes3.OpPartCopy {
+			syncOnce.Do(func() { f.requireNotTheClientsUploads(r.Key) })
+		}
+		return nil
+	})
+	resp, err := f.copy(ente.Drive, syncSource)
+	require.NoError(t, err)
+	require.Len(t, resp.OldToNewFileIDMap, 1)
+	require.Zero(t, f.tempRowCount())
 }

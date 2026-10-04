@@ -18,7 +18,7 @@ type copyRows struct {
 // The rows a multipart copy leaves when the process dies after
 // CreateMultipartUpload: Drive rows come from the batch reservation, other
 // apps' rows from GetUploadURLs.
-func insertCrashedCopyRows(t *testing.T, c *FileController, db *sql.DB, fake *fakeMultipartS3) copyRows {
+func insertCrashedCopyRows(t *testing.T, c *FileController, db *sql.DB, fake fakeS3) copyRows {
 	t.Helper()
 	partLength := 256 * mib
 	size := 5 * gib
@@ -36,10 +36,10 @@ func insertCrashedCopyRows(t *testing.T, c *FileController, db *sql.DB, fake *fa
 		require.NoError(t, c.ObjectCleanupRepo.SetTempObjectPartLength(t.Context(), url.ObjectKey, partLength, time.Microseconds()))
 	}
 	for _, key := range rows.pending {
-		fake.startUpload(key)
+		fake.StartUpload(key)
 	}
 	for _, key := range rows.recorded {
-		uploadID := fake.startUpload(key)
+		uploadID := fake.StartUpload(key)
 		require.NoError(t, c.ObjectCleanupRepo.SetTempObjectUploadID(t.Context(), key, uploadID, time.Microseconds()))
 	}
 	for _, key := range append(rows.pending, rows.recorded...) {
@@ -89,7 +89,7 @@ func TestReleasedCopyRowsFreeQuotaAndWaitForDelayedCleanup(t *testing.T) {
 	require.NoError(t, c.ReserveDriveUploads(t.Context(), uploadLimitsUserID, driveObject(next)))
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.Contains(t, tempObjectKeys(t, db), failed)
-	fake.putObject(failed, size)
+	fake.PutObject(failed, size)
 	setTempObjectExpiry(t, db, failed, time.Microseconds()-1)
 	require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.False(t, fake.hasObject(failed))

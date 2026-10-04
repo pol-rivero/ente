@@ -79,11 +79,7 @@ func (repo *UsageRepository) GetCombinedUsage(ctx context.Context, userIDs []int
 }
 
 func (repo *UsageRepository) LockQuota(ctx context.Context, tx *sql.Tx, subscriptionAdminID int64, timeout time.Duration) error {
-	err := lockAdvisoryXact(ctx, tx, "quota", subscriptionAdminID, timeout)
-	if isLockTimeout(err) {
-		return stacktrace.Propagate(ErrQuotaLockTimeout, "%v", err)
-	}
-	return stacktrace.Propagate(err, "")
+	return lockAdvisoryXact(ctx, tx, "quota", subscriptionAdminID, timeout, ErrQuotaLockTimeout)
 }
 
 var ErrQuotaLockTimeout = errors.New("timed out waiting for the quota lock")

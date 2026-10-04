@@ -443,6 +443,14 @@ func (repo *ObjectRepository) GetObjectSizeAndApp(ctx context.Context, objectKey
 	return size, app, true, nil
 }
 
+func (repo *ObjectRepository) IsLiveObjectOfOwner(ctx context.Context, objectKey string, ownerID int64) (bool, error) {
+	var exists bool
+	err := repo.DB.QueryRowContext(ctx, `
+	SELECT EXISTS (SELECT 1 FROM object_keys ok JOIN files f ON ok.file_id = f.file_id
+		WHERE ok.object_key = $1 AND NOT ok.is_deleted AND f.owner_id = $2)`, objectKey, ownerID).Scan(&exists)
+	return exists, stacktrace.Propagate(err, "")
+}
+
 // Unknown object keys are treated as deleted.
 func (repo *ObjectRepository) GetObjectState(objectKey string) (ObjectState ente.ObjectState, err error) {
 	row := repo.DB.QueryRow(`

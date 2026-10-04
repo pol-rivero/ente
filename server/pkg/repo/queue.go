@@ -122,6 +122,31 @@ func (repo *QueueRepository) AddItems(ctx context.Context, tx *sql.Tx, queueName
 	return nil
 }
 
+// Revives the item if the target queue already had it, since processing a
+// collection twice is harmless.
+func (repo *QueueRepository) MoveItem(ctx context.Context, fromQueue, toQueue string, item string) error {
+	tx, err := repo.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO queue(queue_name, item) VALUES ($1, $2)
+		ON CONFLICT (queue_name, item) DO UPDATE SET is_deleted = FALSE`, toQueue, item); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE queue SET is_deleted = TRUE WHERE queue_name = $1 AND item = $2`,
+		fromQueue, item); err != nil {
+		return stacktrace.Propagate(err, "")
+	}
+	return stacktrace.Propagate(tx.Commit(), "")
+}
+
+func (repo *QueueRepository) MoveToBack(ctx context.Context, queueName string, item string) error {
+	_, err := repo.DB.ExecContext(ctx, `UPDATE queue SET created_at = now_utc_micro_seconds()
+		WHERE queue_name = $1 AND item = $2 AND NOT is_deleted`, queueName, item)
+	return stacktrace.Propagate(err, "")
+}
+
 func (repo *QueueRepository) DeleteItem(queueName string, item string) error {
 	_, err := repo.DB.Exec(`UPDATE queue SET is_deleted = $1 WHERE queue_name = $2 AND item=$3`, true, queueName, item)
 	return stacktrace.Propagate(err, "")

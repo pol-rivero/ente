@@ -24,3 +24,7 @@ func (a App) IsValidForCollection() bool {
 	}
 	return false
 }
+
+func IsCrossAppWithDrive(a, b App) bool {
+	return (a == Drive || b == Drive) && a != b
+}

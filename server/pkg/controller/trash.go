@@ -33,29 +33,32 @@ type TrashController struct {
 	deleteAgedTrashRunning  bool
 
 	driveCollectionTrashRunning atomic.Bool
+	emptyDriveTrashRunning      atomic.Bool
 	driveTrashBudgetOverride    gTime.Duration
 }
 
 const (
 	driveCollectionTrashLock          = "CollectionTrashDrive"
-	driveTrashLockMinutes             = 5
 	defaultDriveCollectionTrashBudget = 50 * gTime.Second
 )
 
 var (
+	driveTrashLease         = 5 * gTime.Minute
 	driveTrashLockHeartbeat = gTime.Minute
-	// Bounds an item stuck on a row lock: the heartbeats would otherwise keep
-	// the leases, and every owner's Drive deletes, held forever. Progress is
-	// committed per batch, so the item resumes on a later run.
-	driveTrashItemTimeout = 5 * gTime.Minute
+	// An item that takes longer goes to the back of the queue, so one large
+	// delete can't hold up everyone else's.
+	driveTrashItemSlice = 20 * gTime.Second
+	// Bounds a batch stuck on a row lock. Progress is committed per batch, so
+	// the item resumes on a later run.
+	driveTrashBatchTimeout = 2 * gTime.Minute
 )
 
 type driveTrashOutcome int
 
 const (
 	driveTrashDone driveTrashOutcome = iota
+	driveTrashYielded
 	driveTrashFailed
-	driveTrashSkipped
 )
 
 func (t *TrashController) GetDiff(userID int64, sinceTime int64, app ente.App) ([]ente.Trash, bool, error) {
@@ -109,7 +112,11 @@ func (t *TrashController) EmptyTrash(ctx context.Context, userID int64, req ente
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	defer t.ProcessEmptyTrashRequests()
+	if app == ente.Drive {
+		defer t.processEmptyDriveTrashRequests()
+	} else {
+		defer t.processEmptyTrashRequests()
+	}
 	return nil
 }
 
@@ -152,9 +159,10 @@ func (t *TrashController) CleanupTrashedDriveCollections() {
 		return
 	}
 	defer t.driveCollectionTrashRunning.Store(false)
-	// One instance at a time, or the others would keep missing the per-owner
-	// locks of the owners being processed.
-	lockStatus, err := t.TaskLockRepo.AcquireLock(driveCollectionTrashLock, time.MicrosecondsAfterMinutes(driveTrashLockMinutes), t.HostName)
+	// Every Drive collection is trashed under this lock, so one owner's items
+	// never run concurrently.
+	leaseEnd := gTime.Now().Add(driveTrashLease)
+	lockStatus, err := t.TaskLockRepo.AcquireLock(driveCollectionTrashLock, leaseEnd.UnixMicro(), t.HostName)
 	if err != nil || !lockStatus {
 		if err != nil {
 			ctxLogger.WithError(err).Error("error while acquiring lock")
@@ -166,17 +174,21 @@ func (t *TrashController) CleanupTrashedDriveCollections() {
 			ctxLogger.WithError(releaseErr).Error("Error while releasing lock")
 		}
 	}()
-	ctx, stopHeartbeat := t.keepTaskLock(context.Background(), driveCollectionTrashLock, ctxLogger)
+	ctx, stopHeartbeat := t.keepTaskLock(context.Background(), driveCollectionTrashLock, leaseEnd, ctxLogger)
 	defer stopHeartbeat()
-	processed, failed := 0, 0
+	outcomes := make(map[driveTrashOutcome]int)
 	defer func() {
-		if processed+failed > 0 {
-			ctxLogger.WithFields(log.Fields{"items_processed": processed, "items_failed": failed}).Info("cron run finished")
+		if len(outcomes) > 0 {
+			ctxLogger.WithFields(log.Fields{
+				"items_processed": outcomes[driveTrashDone],
+				"items_yielded":   outcomes[driveTrashYielded],
+				"items_failed":    outcomes[driveTrashFailed],
+			}).Info("cron run finished")
 		}
 	}()
-	busyOwners := make(map[int64]bool)
 	deadline := gTime.Now().Add(t.driveCollectionTrashBudget())
 	cursor := repo.QueueItem{CreatedAt: math.MinInt64}
+	failed := make(map[int64]bool)
 	for {
 		items, err := t.QueueRepo.GetItemsReadyForDeletionAfter(ctx, repo.TrashCollectionDriveQueue, cursor, 100)
 		if err != nil {
@@ -189,13 +201,24 @@ func (t *TrashController) CleanupTrashedDriveCollections() {
 			if ctx.Err() != nil {
 				return
 			}
-			switch t.trashQueuedDriveCollection(ctx, item, busyOwners, ctxLogger) {
-			case driveTrashDone:
-				processed++
-			case driveTrashFailed:
-				failed++
-			}
 			cursor = item
+			if failed[item.Id] {
+				continue
+			}
+			yieldAt := gTime.Now().Add(driveTrashItemSlice)
+			if yieldAt.After(deadline) {
+				yieldAt = deadline
+			}
+			outcome := t.trashQueuedDriveCollection(ctx, item, yieldAt, ctxLogger)
+			outcomes[outcome]++
+			if outcome == driveTrashFailed && ctx.Err() == nil {
+				// Otherwise an item that keeps failing, e.g. on a row lock,
+				// would be the first one of every run.
+				failed[item.Id] = true
+				if err := t.QueueRepo.MoveToBack(ctx, repo.TrashCollectionDriveQueue, item.Item); err != nil {
+					ctxLogger.WithError(err).WithField("collection_id", item.Item).Error("failed to move item to the back of the queue")
+				}
+			}
 			if gTime.Now().After(deadline) {
 				return
 			}
@@ -206,29 +229,45 @@ func (t *TrashController) CleanupTrashedDriveCollections() {
 	}
 }
 
-// The returned context is cancelled when the lock is lost.
-func (t *TrashController) keepTaskLock(ctx context.Context, lockName string, logger *log.Entry) (context.Context, func()) {
+// The returned context is cancelled when the lock is lost, or when it may
+// expire because extending it keeps failing.
+func (t *TrashController) keepTaskLock(ctx context.Context, lockName string, leaseEnd gTime.Time, logger *log.Entry) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
+	logger = logger.WithField("lock", lockName)
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
 		ticker := gTime.NewTicker(driveTrashLockHeartbeat)
 		defer ticker.Stop()
+		// Stop a heartbeat early, so a batch still running can roll back
+		// before another host takes the lock.
+		stopAt := func() gTime.Duration { return gTime.Until(leaseEnd) - driveTrashLockHeartbeat }
+		expiry := gTime.NewTimer(stopAt())
+		defer expiry.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-expiry.C:
+				logger.Error("couldn't extend lock, stopping")
+				cancel()
+				return
 			case <-ticker.C:
-				held, err := t.TaskLockRepo.ExtendLock(lockName, time.MicrosecondsAfterMinutes(driveTrashLockMinutes), t.HostName)
-				if err != nil {
-					logger.WithError(err).WithField("lock", lockName).Error("failed to extend lock")
-					continue
-				}
-				if !held {
-					logger.WithField("lock", lockName).Error("lock lost, stopping")
-					cancel()
-					return
-				}
+			}
+			newLeaseEnd := gTime.Now().Add(driveTrashLease)
+			callCtx, cancelCall := context.WithDeadline(ctx, leaseEnd.Add(-driveTrashLockHeartbeat))
+			held, err := t.TaskLockRepo.ExtendLockContext(callCtx, lockName, newLeaseEnd.UnixMicro(), t.HostName)
+			cancelCall()
+			switch {
+			case err != nil:
+				logger.WithError(err).Warn("failed to extend lock")
+			case !held:
+				logger.Error("lock lost, stopping")
+				cancel()
+				return
+			default:
+				leaseEnd = newLeaseEnd
+				expiry.Reset(stopAt())
 			}
 		}
 	}()
@@ -249,6 +288,11 @@ func (t *TrashController) driveCollectionTrashBudget() gTime.Duration {
 }
 
 func (t *TrashController) ProcessEmptyTrashRequests() {
+	t.processEmptyTrashRequests()
+	t.processEmptyDriveTrashRequests()
+}
+
+func (t *TrashController) processEmptyTrashRequests() {
 	if t.emptyTrashRunning {
 		log.Info("Already processing empty trash requests, skipping cron")
 		return
@@ -269,18 +313,25 @@ func (t *TrashController) ProcessEmptyTrashRequests() {
 	itemsLocker, err2 := t.QueueRepo.GetItemsReadyForDeletion(repo.TrashEmptyLockerQueue, 100)
 	if err2 != nil {
 		log.Error("Could not fetch from emptyTrashLockerQueue queue", err2)
-	} else {
-		for _, item := range itemsLocker {
-			t.emptyTrash(item, ente.Locker, repo.TrashEmptyLockerQueue)
-		}
-	}
-
-	itemsDrive, err3 := t.QueueRepo.GetItemsReadyForDeletion(repo.TrashEmptyDriveQueue, 100)
-	if err3 != nil {
-		log.Error("Could not fetch from emptyTrashDriveQueue queue", err3)
 		return
 	}
-	for _, item := range itemsDrive {
+	for _, item := range itemsLocker {
+		t.emptyTrash(item, ente.Locker, repo.TrashEmptyLockerQueue)
+	}
+}
+
+func (t *TrashController) processEmptyDriveTrashRequests() {
+	if !t.emptyDriveTrashRunning.CompareAndSwap(false, true) {
+		log.Info("Already processing Drive empty trash requests, skipping")
+		return
+	}
+	defer t.emptyDriveTrashRunning.Store(false)
+	items, err := t.QueueRepo.GetItemsReadyForDeletion(repo.TrashEmptyDriveQueue, 100)
+	if err != nil {
+		log.Error("Could not fetch from emptyTrashDriveQueue queue", err)
+		return
+	}
+	for _, item := range items {
 		t.emptyTrash(item, ente.Drive, repo.TrashEmptyDriveQueue)
 	}
 }
@@ -340,7 +391,6 @@ func (t *TrashController) removeFilesWithVersion(trashedFiles []ente.Trash, vers
 	return trashedFiles[0 : i+1]
 }
 
-// Items of either queue are handled by their collection's stored app.
 func (t *TrashController) trashCollection(item repo.QueueItem, queueName string, logger *log.Entry) {
 	cID, _ := strconv.ParseInt(item.Item, 10, 64)
 	collection, err := t.CollectionRepo.Get(cID)
@@ -348,20 +398,21 @@ func (t *TrashController) trashCollection(item repo.QueueItem, queueName string,
 		log.Error("Could not fetch collection "+item.Item, err)
 		return
 	}
-	if collection.App == string(ente.Drive) {
-		t.trashDriveCollection(context.Background(), item, collection, queueName, logger, nil)
-		return
-	}
-	t.trashNonDriveCollection(item, cID, collection, queueName, logger)
-}
-
-func (t *TrashController) trashNonDriveCollection(item repo.QueueItem, cID int64, collection ente.Collection, queueName string, logger *log.Entry) bool {
 	ctxLogger := logger.WithFields(log.Fields{
 		"collection_id": cID,
 		"user_id":       collection.Owner.ID,
 		"queue":         queueName,
 		"flow":          "trash_collection",
 	})
+	if collection.App == string(ente.Drive) {
+		// Only the Drive cron trashes Drive collections.
+		if err := t.QueueRepo.MoveItem(context.Background(), queueName, repo.TrashCollectionDriveQueue, item.Item); err != nil {
+			ctxLogger.WithError(err).Error("failed to move Drive collection to its queue")
+			return
+		}
+		ctxLogger.Info("moved Drive collection to its queue")
+		return
+	}
 	// File exclusivity spans collections, so lock the user rather than one
 	// collection.
 	lockName := fmt.Sprintf("CollectionTrash:%d", collection.Owner.ID)
@@ -372,7 +423,7 @@ func (t *TrashController) trashNonDriveCollection(item repo.QueueItem, cID int64
 		} else {
 			ctxLogger.WithError(err).Error("critical: error while acquiring lock")
 		}
-		return false
+		return
 	}
 	defer func() {
 		releaseErr := t.TaskLockRepo.ReleaseLock(lockName)
@@ -384,22 +435,22 @@ func (t *TrashController) trashNonDriveCollection(item repo.QueueItem, cID int64
 	err = t.CollectionRepo.TrashV3(context.Background(), cID)
 	if err != nil {
 		ctxLogger.WithError(err).Error("failed to trash collection")
-		return false
+		return
 	}
 	err = t.QueueRepo.DeleteItem(queueName, item.Item)
 	if err != nil {
 		ctxLogger.WithError(err).Error("failed to delete item from queue")
-		return false
+		return
 	}
-	return true
 }
 
-func (t *TrashController) trashQueuedDriveCollection(ctx context.Context, item repo.QueueItem, busyOwners map[int64]bool, logger *log.Entry) driveTrashOutcome {
+func (t *TrashController) trashQueuedDriveCollection(ctx context.Context, item repo.QueueItem, yieldAt gTime.Time, logger *log.Entry) driveTrashOutcome {
+	queueName := repo.TrashCollectionDriveQueue
 	cID, _ := strconv.ParseInt(item.Item, 10, 64)
 	collection, err := t.CollectionRepo.Get(cID)
 	if errors.Is(err, sql.ErrNoRows) {
 		logger.WithField("collection_id", item.Item).Warn("queued collection doesn't exist, dropping it from the queue")
-		if err := t.QueueRepo.DeleteItem(repo.TrashCollectionDriveQueue, item.Item); err != nil {
+		if err := t.QueueRepo.DeleteItem(queueName, item.Item); err != nil {
 			logger.WithError(err).Error("failed to delete item from queue")
 		}
 		return driveTrashFailed
@@ -408,30 +459,19 @@ func (t *TrashController) trashQueuedDriveCollection(ctx context.Context, item r
 		logger.WithError(err).WithField("collection_id", item.Item).Error("Could not fetch collection")
 		return driveTrashFailed
 	}
-	if collection.App != string(ente.Drive) {
-		if t.trashNonDriveCollection(item, cID, collection, repo.TrashCollectionDriveQueue, logger) {
-			return driveTrashDone
-		}
-		return driveTrashFailed
-	}
-	return t.trashDriveCollection(ctx, item, collection, repo.TrashCollectionDriveQueue, logger, busyOwners)
-}
-
-// Drive files are never in Photos/Locker collections, so Drive deletes take
-// their own per-owner lock and a long Drive drain doesn't hold up the owner's
-// album deletes. busyOwners collects owners whose lock was taken elsewhere,
-// to skip their remaining items for the run.
-func (t *TrashController) trashDriveCollection(ctx context.Context, item repo.QueueItem, collection ente.Collection, queueName string, logger *log.Entry, busyOwners map[int64]bool) driveTrashOutcome {
-	ownerID := collection.Owner.ID
-	if busyOwners[ownerID] {
-		return driveTrashSkipped
-	}
 	ctxLogger := logger.WithFields(log.Fields{
 		"collection_id": collection.ID,
-		"user_id":       ownerID,
+		"user_id":       collection.Owner.ID,
 		"queue":         queueName,
 		"flow":          "trash_collection",
 	})
+	if collection.App != string(ente.Drive) {
+		ctxLogger.Error("queued collection isn't a Drive collection, moving it to the V3 queue")
+		if err := t.QueueRepo.MoveItem(ctx, queueName, repo.TrashCollectionQueueV3, item.Item); err != nil {
+			ctxLogger.WithError(err).Error("failed to move item to the V3 queue")
+		}
+		return driveTrashFailed
+	}
 	if !collection.IsDeleted {
 		ctxLogger.Error("queued Drive collection isn't deleted, dropping it from the queue")
 		if err := t.QueueRepo.DeleteItem(queueName, item.Item); err != nil {
@@ -439,39 +479,24 @@ func (t *TrashController) trashDriveCollection(ctx context.Context, item repo.Qu
 		}
 		return driveTrashFailed
 	}
-	lockName := fmt.Sprintf("CollectionTrash:%d:drive", ownerID)
-	lockStatus, err := t.TaskLockRepo.AcquireLock(lockName, time.MicrosecondsAfterMinutes(driveTrashLockMinutes), t.HostName)
-	if err != nil {
-		ctxLogger.WithError(err).Error("critical: error while acquiring lock")
-		return driveTrashFailed
-	}
-	if !lockStatus {
-		if busyOwners != nil {
-			busyOwners[ownerID] = true
-		}
-		ctxLogger.Info("Drive collections of this user are being trashed elsewhere, skipping them")
-		return driveTrashSkipped
-	}
-	defer func() {
-		if releaseErr := t.TaskLockRepo.ReleaseLockBy(lockName, t.HostName); releaseErr != nil {
-			ctxLogger.WithError(releaseErr).Error("Error while releasing lock")
-		}
-	}()
-	ctx, stopHeartbeat := t.keepTaskLock(ctx, lockName, ctxLogger)
-	defer stopHeartbeat()
-	itemCtx, cancel := context.WithTimeout(ctx, driveTrashItemTimeout)
-	defer cancel()
 	ctxLogger.Debug("start trashing collection")
-	if err := t.CollectionRepo.TrashDriveCollection(itemCtx, collection.ID, ownerID); err != nil {
-		switch {
-		case errors.Is(itemCtx.Err(), context.DeadlineExceeded):
-			ctxLogger.WithError(err).Error("timed out trashing collection")
-		case ctx.Err() != nil:
-			ctxLogger.WithError(err).Info("stopped trashing collection")
-		default:
-			ctxLogger.WithError(err).Error("failed to trash collection")
-		}
+	finished, err := t.CollectionRepo.TrashDriveCollection(ctx, collection.ID, collection.Owner.ID, yieldAt, driveTrashBatchTimeout)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		ctxLogger.WithError(err).Info("stopped trashing collection")
 		return driveTrashFailed
+	case errors.Is(err, repo.ErrDriveTrashBatchTimeout):
+		ctxLogger.WithError(err).Error("timed out trashing collection")
+		return driveTrashFailed
+	case err != nil:
+		ctxLogger.WithError(err).Error("failed to trash collection")
+		return driveTrashFailed
+	case !finished:
+		ctxLogger.Info("collection not trashed yet, moving it to the back of the queue")
+		if err := t.QueueRepo.MoveToBack(ctx, queueName, item.Item); err != nil {
+			ctxLogger.WithError(err).Error("failed to move item to the back of the queue")
+		}
+		return driveTrashYielded
 	}
 	if err := t.QueueRepo.DeleteItem(queueName, item.Item); err != nil {
 		ctxLogger.WithError(err).Error("failed to delete item from queue")
@@ -482,6 +507,11 @@ func (t *TrashController) trashDriveCollection(ctx context.Context, item repo.Qu
 
 func (t *TrashController) emptyTrash(item repo.QueueItem, app ente.App, queueName string) {
 	lockName := fmt.Sprintf("EmptyTrash:%s", item.Item)
+	if app == ente.Drive {
+		// Account deletion queues the same item for every app, and Drive's
+		// queue drains concurrently with the others.
+		lockName = fmt.Sprintf("EmptyTrash:drive:%s", item.Item)
+	}
 	lockStatus, err := t.TaskLockRepo.AcquireLock(lockName, time.MicrosecondsAfterHours(1), t.HostName)
 	split := strings.Split(item.Item, repo.EmptyTrashQueueItemSeparator)
 	userID, _ := strconv.ParseInt(split[0], 10, 64)

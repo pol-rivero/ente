@@ -44,9 +44,12 @@ type CollectionShareItem struct {
 }
 
 func (repo *CollectionRepository) Create(c ente.Collection) (ente.Collection, error) {
+	c.ClearParent()
 	return insertCollection(context.Background(), repo.DB, c)
 }
 
+// The DB doesn't check the parent: set one only after validating it under the
+// tree lock.
 func (repo *CollectionRepository) CreateTx(ctx context.Context, tx *sql.Tx, c ente.Collection) (ente.Collection, error) {
 	return insertCollection(ctx, tx, c)
 }
@@ -1297,6 +1300,14 @@ func (repo *CollectionRepository) LockCollectionsTx(ctx context.Context, tx *sql
 	_, err := tx.ExecContext(ctx, `SELECT 1 FROM collections WHERE collection_id = ANY($1) ORDER BY collection_id FOR UPDATE`,
 		pq.Array(collectionIDs))
 	return stacktrace.Propagate(err, "")
+}
+
+// Deleted collections count: their files may still be in the trash.
+func (repo *CollectionRepository) HasDriveCollections(ctx context.Context, ownerID int64) (bool, error) {
+	var exists bool
+	err := repo.DB.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM collections WHERE owner_id = $1 AND app = $2)`,
+		ownerID, ente.Drive).Scan(&exists)
+	return exists, stacktrace.Propagate(err, "")
 }
 
 func (repo *CollectionRepository) GetLiveDriveCollectionIDSet(ctx context.Context, ownerID int64) (map[int64]bool, error) {

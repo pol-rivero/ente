@@ -22,13 +22,13 @@ esac
 
 if [ "$mode" = docker ]; then
     container="ente-server-test-postgres-$$"
-    trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT INT TERM
+    trap 'docker rm -f -v "$container" >/dev/null 2>&1 || true' EXIT INT TERM
     docker run --detach \
         --name "$container" \
         --env POSTGRES_DB="$test_db" \
         --env POSTGRES_PASSWORD=test_pass \
         --publish 127.0.0.1::5432 \
-        postgres:15 >/dev/null
+        postgres:15 -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
     port=$(docker port "$container" 5432/tcp)
     port=${port##*:}
     # Probe over TCP: the socket-only temporary server that runs during

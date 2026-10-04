@@ -161,12 +161,20 @@ func (c *DeleteUserCleanupController) emptyTrash(ctx context.Context, item *enti
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
-	err = c.TrashRepo.EmptyTrash(ctx, item.UserID, time.Microseconds(), ente.Drive)
+	err = c.emptyDriveTrash(ctx, item.UserID, time.Microseconds())
 	if err != nil {
 		return stacktrace.Propagate(err, "")
 	}
 	// schedule storage consumed check for the user after 60min. Trash should ideally get emptied after 60 min
 	return c.Repo.MoveToNextStage(ctx, item.UserID, entity.Storage, time.MicrosecondsAfterMinutes(60))
+}
+
+func (c *DeleteUserCleanupController) emptyDriveTrash(ctx context.Context, userID int64, lastUpdatedAt int64) error {
+	hasDrive, err := c.CollectionRepo.HasDriveCollections(ctx, userID)
+	if err != nil || !hasDrive {
+		return stacktrace.Propagate(err, "")
+	}
+	return stacktrace.Propagate(c.TrashRepo.EmptyTrash(ctx, userID, lastUpdatedAt, ente.Drive), "")
 }
 
 func (c *DeleteUserCleanupController) completeCleanup(ctx context.Context, item *entity.DataCleanup) error {
@@ -209,7 +217,7 @@ func (c *DeleteUserCleanupController) storageCheck(ctx context.Context, item *en
 			if err != nil {
 				return stacktrace.Propagate(err, "")
 			}
-			err = c.TrashRepo.EmptyTrash(ctx, item.UserID, *timeStamp, ente.Drive)
+			err = c.emptyDriveTrash(ctx, item.UserID, *timeStamp)
 			if err != nil {
 				return stacktrace.Propagate(err, "")
 			}

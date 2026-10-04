@@ -59,6 +59,7 @@ func TestTempObjectsResumeMigration(t *testing.T) {
 		{column: "part_length", dataType: "bigint", nullable: "YES"},
 		{column: "resume_parts_completed", dataType: "integer", nullable: "YES"},
 		{column: "reservation_released", dataType: "boolean", nullable: "NO", defaultValue: sql.NullString{String: "false", Valid: true}},
+		{column: "is_copy", dataType: "boolean", nullable: "NO", defaultValue: sql.NullString{String: "false", Valid: true}},
 	} {
 		var dataType, nullable string
 		var defaultValue sql.NullString
@@ -77,12 +78,13 @@ func TestTempObjectsResumeMigration(t *testing.T) {
 		) VALUES ('1/old-binary', 1, 'upload', TRUE, 'b2-eu-cen', $1, 'drive', 'file_upload', 10, NULL, 'client')`, userID)
 	require.NoError(t, err)
 	var partLength, partsCompleted sql.NullInt64
-	var released bool
-	require.NoError(t, db.QueryRow(`SELECT part_length, resume_parts_completed, reservation_released
-		FROM temp_objects WHERE object_key = '1/old-binary'`).Scan(&partLength, &partsCompleted, &released))
+	var released, isCopy bool
+	require.NoError(t, db.QueryRow(`SELECT part_length, resume_parts_completed, reservation_released, is_copy
+		FROM temp_objects WHERE object_key = '1/old-binary'`).Scan(&partLength, &partsCompleted, &released, &isCopy))
 	require.False(t, partLength.Valid)
 	require.False(t, partsCompleted.Valid)
 	require.False(t, released)
+	require.False(t, isCopy)
 
 	repo := &ObjectCleanupRepository{DB: db}
 	require.NoError(t, repo.AddTempObject(ente.TempObject{ObjectKey: "1/single", BucketId: "b2-eu-cen", UserID: userID}, 1))

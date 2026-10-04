@@ -32,6 +32,45 @@ type Collection struct {
 	ParentID            *int64         `json:"parentID,omitempty"`
 	ParentEncryptedKey  *string        `json:"parentEncryptedKey,omitempty"`
 	ParentKeyNonce      *string        `json:"parentKeyNonce,omitempty"`
+
+	invalidParentFields bool
+}
+
+// Other apps have always ignored the parent fields, so a malformed one mustn't
+// fail their requests: it's dropped and flagged, and Drive rejects it.
+func (c *Collection) UnmarshalJSON(data []byte) error {
+	type plain Collection
+	fields := struct {
+		*plain
+		ParentID           json.RawMessage `json:"parentID"`
+		ParentEncryptedKey json.RawMessage `json:"parentEncryptedKey"`
+		ParentKeyNonce     json.RawMessage `json:"parentKeyNonce"`
+	}{plain: (*plain)(c)}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	validID := decodeOptional(fields.ParentID, &c.ParentID)
+	validKey := decodeOptional(fields.ParentEncryptedKey, &c.ParentEncryptedKey)
+	validNonce := decodeOptional(fields.ParentKeyNonce, &c.ParentKeyNonce)
+	c.invalidParentFields = !validID || !validKey || !validNonce
+	return nil
+}
+
+func decodeOptional[T any](raw json.RawMessage, dst **T) bool {
+	if raw == nil {
+		return true
+	}
+	var value *T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		*dst = nil
+		return false
+	}
+	*dst = value
+	return true
+}
+
+func (c *Collection) HasInvalidParentFields() bool {
+	return c.invalidParentFields
 }
 
 // A top-level folder has depth 1.

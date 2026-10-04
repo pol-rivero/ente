@@ -12,15 +12,16 @@ import (
 
 	"github.com/ente/museum/ente"
 	"github.com/ente/museum/internal/testutil"
+	"github.com/ente/museum/internal/testutil/fakes3"
 	"github.com/ente/museum/pkg/utils/time"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
 
-func setupQuotaTest(t *testing.T, storage int64) (*FileController, *sql.DB, *fakeMultipartS3) {
+func setupQuotaTest(t *testing.T, storage int64) (*FileController, *sql.DB, fakeS3) {
 	t.Helper()
-	fake, s3URL := newFakeMultipartS3(t)
-	c, db := newUploadTestController(t, s3URL, storage)
+	fake := newFakeS3(t)
+	c, db := newUploadTestController(t, fake.URL, storage)
 	return c, db, fake
 }
 
@@ -41,25 +42,6 @@ func requireQuotaExceeded(t *testing.T, err error) {
 	require.ErrorIs(t, err, ente.ErrStorageLimitExceeded)
 }
 
-func waitForAdvisoryLockWaiters(t *testing.T, db *sql.DB, want int) {
-	t.Helper()
-	require.Eventually(t, func() bool {
-		var waiting int
-		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`).Scan(&waiting))
-		return waiting == want
-	}, 5*gotime.Second, 10*gotime.Millisecond)
-}
-
-func holdQuotaLock(t *testing.T, db *sql.DB, subscriptionAdminID int64) *sql.Tx {
-	t.Helper()
-	tx, err := db.Begin()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = tx.Rollback() })
-	_, err = tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended('quota:' || $1::bigint, 0))`, subscriptionAdminID)
-	require.NoError(t, err)
-	return tx
-}
-
 type tempObjectRow struct {
 	uploadID sql.NullString
 	expiry   int64
@@ -74,7 +56,7 @@ func readTempObject(t *testing.T, db *sql.DB, key string) tempObjectRow {
 	return row
 }
 
-func completeFakeUpload(t *testing.T, fake *fakeMultipartS3, key string, size int64) {
+func completeFakeUpload(t *testing.T, fake fakeS3, key string, size int64) {
 	t.Helper()
 	for number := int64(1); size > 0; number++ {
 		part := min(size, gib)
@@ -84,12 +66,12 @@ func completeFakeUpload(t *testing.T, fake *fakeMultipartS3, key string, size in
 	fake.complete(t, key)
 }
 
-func driveThumbnail(t *testing.T, c *FileController, fake *fakeMultipartS3, size int64) string {
+func driveThumbnail(t *testing.T, c *FileController, fake fakeS3, size int64) string {
 	t.Helper()
 	upload, err := c.GetUploadURLWithMetadata(t.Context(), uploadLimitsUserID,
 		ente.UploadURLRequest{ContentLength: size, ContentMD5: "XUFAKrxLKna5cZ2REBfFkg=="}, ente.Drive, "client", false)
 	require.NoError(t, err)
-	fake.putObject(upload.ObjectKey, size)
+	fake.PutObject(upload.ObjectKey, size)
 	return upload.ObjectKey
 }
 
@@ -108,7 +90,7 @@ func setUsage(t *testing.T, db *sql.DB, userID int64, usage int64) {
 
 func TestConcurrentDriveStartsShareFreeQuota(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 10*gib)
-	holder := holdQuotaLock(t, db, uploadLimitsUserID)
+	holder := testutil.HoldQuotaLock(t, db, uploadLimitsUserID)
 
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -120,7 +102,7 @@ func TestConcurrentDriveStartsShareFreeQuota(t *testing.T) {
 		}()
 	}
 	close(start)
-	waitForAdvisoryLockWaiters(t, db, 2)
+	testutil.WaitForAdvisoryLockWaiters(t, db, 2)
 	require.NoError(t, holder.Rollback())
 
 	var admitted, rejected int
@@ -201,7 +183,7 @@ func TestAbortedDriveUploadFreesReservation(t *testing.T) {
 	size := 6 * gib
 	require.NoError(t, c.UsageCtrl.CanUploadFile(t.Context(), uploadLimitsUserID, &size, ente.Drive))
 
-	fake.set(func(f *fakeMultipartS3) { f.failDeletes[aborted.ObjectKey] = true })
+	fake.failOn(fakes3.OpDelete, aborted.ObjectKey)
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	row := readTempObject(t, db, aborted.ObjectKey)
 	require.Greater(t, row.expiry, time.Microseconds())
@@ -221,10 +203,7 @@ func TestExpiredReservationStaysFreedAfterFailedCleanup(t *testing.T) {
 	size := 6 * gib
 	require.NoError(t, c.UsageCtrl.CanUploadFile(t.Context(), uploadLimitsUserID, &size, ente.Drive))
 
-	fake.set(func(f *fakeMultipartS3) {
-		f.failDeletes[expired.ObjectKey] = true
-		f.failDeletes[photos.ObjectKey] = true
-	})
+	fake.failOn(fakes3.OpDelete, expired.ObjectKey, photos.ObjectKey)
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	for key, wantReleased := range map[string]bool{expired.ObjectKey: true, photos.ObjectKey: false} {
 		row := readTempObject(t, db, key)
@@ -283,7 +262,7 @@ func TestPublicDriveUploadsDontReserveOwnerQuota(t *testing.T) {
 	completeFakeUpload(t, fake, publicKeys[0], 6*gib)
 	thumbKey := uploadLimitsKey("public-thumb", 10)
 	stageUploadLimitsObjects(t, db, thumbKey)
-	fake.putObject(thumbKey, 10)
+	fake.PutObject(thumbKey, 10)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/files", nil)
 	_, err = c.Create(ctx, uploadLimitsUserID, objectCleanupTestFile(uploadLimitsUserID, insertUploadLimitsCollection(t, db, ente.Drive),
@@ -291,20 +270,49 @@ func TestPublicDriveUploadsDontReserveOwnerQuota(t *testing.T) {
 	requireQuotaExceeded(t, err)
 }
 
-func TestReservedDriveUploadCommitsDespiteQuotaUse(t *testing.T) {
-	c, db, fake := setupQuotaTest(t, 10*gib)
-	collectionID := insertUploadLimitsCollection(t, db, ente.Drive)
-	upload := requireDriveUpload(t, c, uploadLimitsUserID, 6*gib)
-	completeFakeUpload(t, fake, upload.ObjectKey, 6*gib)
-	thumbKey := driveThumbnail(t, c, fake, 10)
-	setUsage(t, db, uploadLimitsUserID, 9*gib)
-
-	file, err := createTestFile(t, c, ente.Drive, collectionID, upload.ObjectKey, thumbKey)
-	require.NoError(t, err)
-	require.Equal(t, 6*gib, file.File.Size)
+func requireUsage(t *testing.T, c *FileController, want int64) {
+	t.Helper()
 	usage, err := c.UsageCtrl.UsageRepo.GetUsage(uploadLimitsUserID)
 	require.NoError(t, err)
-	require.Equal(t, 15*gib+10, usage)
+	require.Equal(t, want, usage)
+}
+
+func TestReservedDriveUploadCommitIgnoresOtherReservations(t *testing.T) {
+	c, db, fake := setupQuotaTest(t, 10*gib)
+	collectionID := insertUploadLimitsCollection(t, db, ente.Drive)
+	first := requireDriveUpload(t, c, uploadLimitsUserID, 6*gib)
+	second := requireDriveUpload(t, c, uploadLimitsUserID, 4*gib)
+	completeFakeUpload(t, fake, first.ObjectKey, 6*gib)
+	completeFakeUpload(t, fake, second.ObjectKey, 4*gib)
+	firstThumb, secondThumb := driveThumbnail(t, c, fake, 10), driveThumbnail(t, c, fake, 10)
+
+	_, err := createTestFile(t, c, ente.Drive, collectionID, first.ObjectKey, firstThumb)
+	require.NoError(t, err)
+	requireUsage(t, c, 6*gib+10)
+
+	// Bytes committed without a reservation since the upload started (e.g.
+	// Photos uploads) can still make it fail.
+	setUsage(t, db, uploadLimitsUserID, 9*gib)
+	_, err = createTestFile(t, c, ente.Drive, collectionID, second.ObjectKey, secondThumb)
+	requireQuotaExceeded(t, err)
+	require.False(t, readTempObject(t, db, second.ObjectKey).released)
+
+	setUsage(t, db, uploadLimitsUserID, 6*gib+10)
+	file, err := createTestFile(t, c, ente.Drive, collectionID, second.ObjectKey, secondThumb)
+	require.NoError(t, err)
+	require.Equal(t, 4*gib, file.File.Size)
+	requireUsage(t, c, 10*gib+20)
+
+	// A retry after a lost response returns the file instead of a 426.
+	retried, err := createTestFile(t, c, ente.Drive, collectionID, second.ObjectKey, secondThumb)
+	require.NoError(t, err)
+	require.Equal(t, file.ID, retried.ID)
+	requireUsage(t, c, 10*gib+20)
+
+	other := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 2, Email: "quota-retry-other@ente.com", CreationTime: 1})
+	committed, err := c.ObjectRepo.IsLiveObjectOfOwner(t.Context(), second.ObjectKey, other)
+	require.NoError(t, err)
+	require.False(t, committed)
 }
 
 func TestUnreservedDriveCreateIsRechecked(t *testing.T) {
@@ -316,7 +324,7 @@ func TestUnreservedDriveCreateIsRechecked(t *testing.T) {
 	photosFile, err := c.GetUploadURLWithMetadata(t.Context(), uploadLimitsUserID,
 		ente.UploadURLRequest{ContentLength: 5 * gib, ContentMD5: "XUFAKrxLKna5cZ2REBfFkg=="}, ente.Photos, "client", false)
 	require.NoError(t, err)
-	fake.putObject(photosFile.ObjectKey, 5*gib)
+	fake.PutObject(photosFile.ObjectKey, 5*gib)
 	thumbKey := driveThumbnail(t, c, fake, 5*gib)
 	expiry := tempObjectExpiry(t, db, photosFile.ObjectKey)
 
@@ -329,7 +337,7 @@ func TestUnreservedDriveCreateIsRechecked(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, purpose)
 		VALUES ($1, $2, 'b2-eu-cen', 1, 'drive', 'file_upload')`, copyKey, expiry)
 	require.NoError(t, err)
-	fake.putObject(copyKey, gib)
+	fake.PutObject(copyKey, gib)
 	for _, key := range []string{copyKey, expiredUpload.ObjectKey} {
 		_, err = createTestFile(t, c, ente.Drive, collectionID, key, driveThumbnail(t, c, fake, 10))
 		requireQuotaExceeded(t, err)
@@ -337,7 +345,7 @@ func TestUnreservedDriveCreateIsRechecked(t *testing.T) {
 	require.Equal(t, expiry, tempObjectExpiry(t, db, copyKey))
 }
 
-func TestReservedDriveUpdateCommitsDespiteQuotaUse(t *testing.T) {
+func TestReservedDriveUpdateIgnoresOtherReservations(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 10*gib)
 	collectionID := insertUploadLimitsCollection(t, db, ente.Drive)
 	original := driveThumbnail(t, c, fake, 100)
@@ -348,7 +356,7 @@ func TestReservedDriveUpdateCommitsDespiteQuotaUse(t *testing.T) {
 	completeFakeUpload(t, fake, replacement.ObjectKey, 6*gib)
 	replacementThumb := driveThumbnail(t, c, fake, 10)
 	unreservedThumb := driveThumbnail(t, c, fake, 10)
-	setUsage(t, db, uploadLimitsUserID, 9*gib)
+	requireDriveUpload(t, c, uploadLimitsUserID, 3*gib)
 	file.File.ObjectKey, file.Thumbnail.ObjectKey = replacement.ObjectKey, replacementThumb
 	file.File.Size = 0
 	file.UpdationTime = time.Microseconds()
@@ -359,7 +367,7 @@ func TestReservedDriveUpdateCommitsDespiteQuotaUse(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO temp_objects(object_key, expiration_time, bucket_id, user_id, app, purpose)
 		VALUES ($1, $2, 'b2-eu-cen', 1, 'drive', 'file_upload')`, unreserved, time.MicrosecondsAfterDays(1))
 	require.NoError(t, err)
-	fake.putObject(unreserved, 7*gib)
+	fake.PutObject(unreserved, 8*gib)
 	file.File.ObjectKey, file.Thumbnail.ObjectKey = unreserved, unreservedThumb
 	_, err = c.Update(t.Context(), uploadLimitsUserID, file, ente.Drive)
 	requireQuotaExceeded(t, err)
@@ -373,20 +381,21 @@ func insertPendingDriveRow(t *testing.T, db *sql.DB, key string, expiry int64) {
 }
 
 func TestCleanupAbortsUploadsOfPendingRow(t *testing.T) {
-	for name, markers := range map[string]uploadsMarkerMode{"next markers": uploadsMarkersNormal, "no next upload ID": uploadsMarkersOmitUploadID} {
+	for name, quirks := range map[string]fakes3.ListQuirks{"next markers": {}, "no next upload ID": {OmitNextUploadIDMarker: true}} {
 		t.Run(name, func(t *testing.T) {
 			c, db, fake := setupQuotaTest(t, 10*gib)
 			const key = "1/pending-upload-id"
 			insertPendingDriveRow(t, db, key, 1)
-			fake.startUpload(key)
-			fake.startUpload(key)
-			fake.startUpload(key + "-other")
-			fake.set(func(f *fakeMultipartS3) { f.uploadsPageSize = 1; f.uploadsMarkers = markers })
+			fake.StartUpload(key)
+			fake.StartUpload(key)
+			fake.StartUpload(key + "-other")
+			fake.SetPageSize(1, false)
+			fake.SetListQuirks(quirks)
 
 			require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
 			require.False(t, fake.hasUpload(key))
 			require.True(t, fake.hasUpload(key+"-other"))
-			require.Greater(t, fake.listUploadCalls, 1)
+			require.Greater(t, fake.count(fakes3.OpList, ""), 1)
 			require.Empty(t, tempObjectKeys(t, db))
 		})
 	}
@@ -397,12 +406,13 @@ func TestCleanupStopsOnNonAdvancingUploadListing(t *testing.T) {
 	const key = "1/pending-upload-id"
 	insertPendingDriveRow(t, db, key, 1)
 	for range 3 {
-		fake.startUpload(key)
+		fake.StartUpload(key)
 	}
-	fake.set(func(f *fakeMultipartS3) { f.uploadsPageSize = 1; f.uploadsMarkers = uploadsMarkersEchoRequest })
+	fake.SetPageSize(1, false)
+	fake.SetListQuirks(fakes3.ListQuirks{EchoUploadMarkers: true})
 
 	require.Zero(t, c.ObjectCleanupCtrl.removeUnreportedObjects())
-	require.Equal(t, 2, fake.listUploadCalls)
+	require.Equal(t, 2, fake.count(fakes3.OpList, ""))
 	require.Greater(t, tempObjectExpiry(t, db, key), time.Microseconds())
 }
 
@@ -447,7 +457,7 @@ func runPreviousReleaseCleanupPass(t *testing.T, c *ObjectCleanupController, db 
 
 func TestPreviousReleaseCleanupRemovesPendingRow(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 10*gib)
-	fake.set(func(f *fakeMultipartS3) { f.failCreates = true })
+	fake.failOn(fakes3.OpCreate)
 	_, err := startDriveUpload(c, uploadLimitsUserID, 6*gib)
 	require.Error(t, err)
 	insertPendingDriveRow(t, db, "1/pending-expired", 1)
@@ -455,12 +465,12 @@ func TestPreviousReleaseCleanupRemovesPendingRow(t *testing.T) {
 
 	runPreviousReleaseCleanupPass(t, c.ObjectCleanupCtrl, db)
 	require.Empty(t, tempObjectKeys(t, db))
-	require.Zero(t, fake.listUploadCalls)
+	require.Zero(t, fake.count(fakes3.OpList, ""))
 }
 
 func TestDriveStartReleasesRowWhenStorageFails(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 10*gib)
-	fake.set(func(f *fakeMultipartS3) { f.failCreates = true })
+	fake.failOn(fakes3.OpCreate)
 	_, err := startDriveUpload(c, uploadLimitsUserID, 6*gib)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ente.ErrStorageLimitExceeded)
@@ -474,25 +484,23 @@ func TestDriveStartReleasesRowWhenStorageFails(t *testing.T) {
 	size := 6 * gib
 	require.NoError(t, c.UsageCtrl.CanUploadFile(t.Context(), uploadLimitsUserID, &size, ente.Drive))
 
-	fake.set(func(f *fakeMultipartS3) { f.failCreates = false })
+	fake.SetHook(nil)
 	require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
-	require.Equal(t, 1, fake.listUploadCalls)
+	require.Equal(t, 1, fake.count(fakes3.OpList, ""))
 	require.Empty(t, tempObjectKeys(t, db))
 }
 
 // Returns the pending row's key and a function that lets the start continue
 // and returns its result.
-func pauseDriveStartAtStorage(t *testing.T, c *FileController, fake *fakeMultipartS3) (string, func() error) {
+func pauseDriveStartAtStorage(t *testing.T, c *FileController, fake fakeS3) (string, func() error) {
 	t.Helper()
 	entered := make(chan string, 1)
 	gate := make(chan struct{})
 	var release sync.Once
 	t.Cleanup(func() { release.Do(func() { close(gate) }) })
-	fake.set(func(f *fakeMultipartS3) {
-		f.beforeCreate = func(key string) {
-			entered <- key
-			<-gate
-		}
+	fake.beforeCreate(func(key string) {
+		entered <- key
+		<-gate
 	})
 	done := make(chan error, 1)
 	go func() {
@@ -513,7 +521,7 @@ func TestResumeWhileUploadIDPendingIsBusy(t *testing.T) {
 	require.False(t, before.uploadID.Valid)
 
 	_, err := c.ResumeMultipartUpload(t.Context(), uploadLimitsUserID, key)
-	requireAPIError(t, err, http.StatusConflict, ente.UploadBusy)
+	testutil.RequireAPIError(t, err, http.StatusConflict, ente.UploadBusy)
 	require.Equal(t, before, readTempObject(t, db, key))
 
 	require.NoError(t, finish())
@@ -525,19 +533,19 @@ func TestResumeWhileUploadIDPendingIsBusy(t *testing.T) {
 func TestAbortWhileUploadIDPendingCancelsTheStart(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 10*gib)
 	key, finish := pauseDriveStartAtStorage(t, c, fake)
-	requestsBefore := fake.requestCount()
+	requestsBefore := len(fake.Requests())
 
 	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, key))
-	require.Equal(t, requestsBefore, fake.requestCount())
+	require.Equal(t, requestsBefore, len(fake.Requests()))
 	requireExpiredAndReleased(t, db, key)
 	size := 6 * gib
 	require.NoError(t, c.UsageCtrl.CanUploadFile(t.Context(), uploadLimitsUserID, &size, ente.Drive))
 
-	requireAPIError(t, finish(), http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, finish(), http.StatusGone, ente.UploadGone)
 	require.False(t, readTempObject(t, db, key).uploadID.Valid)
 	require.False(t, fake.hasUpload(key))
 
-	fake.startUpload(key)
+	fake.StartUpload(key)
 	require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.False(t, fake.hasUpload(key))
 	require.Empty(t, tempObjectKeys(t, db))
@@ -550,14 +558,14 @@ func TestAbortReleasesDriveSinglePutUpload(t *testing.T) {
 	require.NoError(t, err)
 	_, err = startDriveUpload(c, uploadLimitsUserID, 6*gib)
 	requireQuotaExceeded(t, err)
-	fake.putObject(single.ObjectKey, 5*gib)
-	requestsBefore := fake.requestCount()
+	fake.PutObject(single.ObjectKey, 5*gib)
+	requestsBefore := len(fake.Requests())
 
 	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, single.ObjectKey))
-	require.Equal(t, requestsBefore, fake.requestCount())
+	require.Equal(t, requestsBefore, len(fake.Requests()))
 	requireExpiredAndReleased(t, db, single.ObjectKey)
 	requireDriveUpload(t, c, uploadLimitsUserID, 6*gib)
-	requireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, single.ObjectKey), http.StatusGone, ente.UploadGone)
+	testutil.RequireAPIError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, single.ObjectKey), http.StatusGone, ente.UploadGone)
 
 	require.Equal(t, 1, c.ObjectCleanupCtrl.removeUnreportedObjects())
 	require.False(t, fake.hasObject(single.ObjectKey))
@@ -595,19 +603,17 @@ func TestNonDriveUploadStartsKeepTheirOrderAndSkipTheQuotaLock(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 100*gib)
 	rowAtCreate := make(map[string]bool)
 	var mu sync.Mutex
-	fake.set(func(f *fakeMultipartS3) {
-		f.beforeCreate = func(key string) {
-			var exists bool
-			if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM temp_objects WHERE object_key = $1)`, key).Scan(&exists); err != nil {
-				t.Errorf("reading temp object: %v", err)
-			}
-			mu.Lock()
-			rowAtCreate[key] = exists
-			mu.Unlock()
+	fake.beforeCreate(func(key string) {
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM temp_objects WHERE object_key = $1)`, key).Scan(&exists); err != nil {
+			t.Errorf("reading temp object: %v", err)
 		}
+		mu.Lock()
+		rowAtCreate[key] = exists
+		mu.Unlock()
 	})
 	request := ente.MultipartUploadURLRequest{ContentLength: 12 * mib, PartLength: 5 * mib}
-	holdQuotaLock(t, db, uploadLimitsUserID)
+	testutil.HoldQuotaLock(t, db, uploadLimitsUserID)
 	for _, app := range []ente.App{ente.Photos, ente.Locker} {
 		ctx, cancel := context.WithTimeout(t.Context(), 2*gotime.Second)
 		upload, err := c.GetMultipartUploadURLWithMetadata(ctx, uploadLimitsUserID, request, app, "client", false)
@@ -627,12 +633,10 @@ func TestDriveStartInsertsRowBeforeStorageCall(t *testing.T) {
 	c, db, fake := setupQuotaTest(t, 100*gib)
 	var uploadIDAtCreate sql.NullString
 	multipartAtCreate := true
-	fake.set(func(f *fakeMultipartS3) {
-		f.beforeCreate = func(key string) {
-			if err := db.QueryRow(`SELECT upload_id, is_multipart FROM temp_objects WHERE object_key = $1`, key).
-				Scan(&uploadIDAtCreate, &multipartAtCreate); err != nil {
-				t.Errorf("reading temp object: %v", err)
-			}
+	fake.beforeCreate(func(key string) {
+		if err := db.QueryRow(`SELECT upload_id, is_multipart FROM temp_objects WHERE object_key = $1`, key).
+			Scan(&uploadIDAtCreate, &multipartAtCreate); err != nil {
+			t.Errorf("reading temp object: %v", err)
 		}
 	})
 	upload := requireDriveUpload(t, c, uploadLimitsUserID, 6*gib)
@@ -690,7 +694,7 @@ func TestOverQuotaDriveStartsDontDeadlockThePool(t *testing.T) {
 	const poolSize = 4
 	pool.SetMaxOpenConns(poolSize)
 	c.UsageCtrl = newTestUsageController(pool)
-	holder := holdQuotaLock(t, pool, uploadLimitsUserID)
+	holder := testutil.HoldQuotaLock(t, pool, uploadLimitsUserID)
 
 	const starts = 3 * poolSize
 	results := make(chan error, starts)
@@ -700,7 +704,7 @@ func TestOverQuotaDriveStartsDontDeadlockThePool(t *testing.T) {
 			results <- err
 		}()
 	}
-	waitForAdvisoryLockWaiters(t, db, poolSize-1)
+	testutil.WaitForAdvisoryLockWaiters(t, db, min(poolSize-1, maxConcurrentDriveReservationsPerAdmin))
 	require.NoError(t, holder.Rollback())
 	deadline := gotime.After(5 * gotime.Second)
 	for range starts {
@@ -721,11 +725,11 @@ func TestDriveStartFailsFastWhenTheQuotaCheckIsBusy(t *testing.T) {
 		t.Helper()
 		start := gotime.Now()
 		_, err := startDriveUpload(c, uploadLimitsUserID, gib)
-		requireAPIError(t, err, http.StatusServiceUnavailable, ente.QuotaCheckBusy)
+		testutil.RequireAPIError(t, err, http.StatusServiceUnavailable, ente.QuotaCheckBusy)
 		require.Less(t, gotime.Since(start), 2*gotime.Second)
 	}
 
-	holder := holdQuotaLock(t, db, uploadLimitsUserID)
+	holder := testutil.HoldQuotaLock(t, db, uploadLimitsUserID)
 	requireBusy()
 	require.NoError(t, holder.Rollback())
 
@@ -751,8 +755,8 @@ func TestDriveCommitAdmitsReservedKeysAndChecksTheRest(t *testing.T) {
 	tooLarge := uploadLimitsKey("unreserved-thumb", 5*gib)
 	fits := uploadLimitsKey("unreserved-thumb", 3*gib)
 	stageUploadLimitsObjects(t, db, tooLarge, fits)
-	fake.putObject(tooLarge, 5*gib)
-	fake.putObject(fits, 3*gib)
+	fake.PutObject(tooLarge, 5*gib)
+	fake.PutObject(fits, 3*gib)
 
 	_, err := createTestFile(t, c, ente.Drive, collectionID, upload.ObjectKey, tooLarge)
 	requireQuotaExceeded(t, err)
@@ -770,7 +774,7 @@ func TestDriveCommitChecksKeysWithoutAnOwnSufficientReservation(t *testing.T) {
 	otherUserID := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 2, Email: "quota-other@ente.com", CreationTime: 1})
 	thumbKey := uploadLimitsKey("reserved-thumb", 10)
 	insertDriveReservation(t, db, thumbKey, uploadLimitsUserID, 10)
-	fake.putObject(thumbKey, 10)
+	fake.PutObject(thumbKey, 10)
 
 	undersized := uploadLimitsKey("undersized", 2*gib)
 	insertDriveReservation(t, db, undersized, uploadLimitsUserID, gib)
@@ -781,7 +785,7 @@ func TestDriveCommitChecksKeysWithoutAnOwnSufficientReservation(t *testing.T) {
 	require.NoError(t, c.AbortMultipartUpload(t.Context(), uploadLimitsUserID, aborted.ObjectKey))
 	setTempObjectExpiry(t, db, aborted.ObjectKey, time.MicrosecondsAfterDays(1))
 	for _, key := range []string{undersized, foreign} {
-		fake.putObject(key, 2*gib)
+		fake.PutObject(key, 2*gib)
 	}
 	setUsage(t, db, uploadLimitsUserID, 8*gib+gib/2)
 
@@ -799,7 +803,7 @@ func TestUpdateThumbnailUsesTheStoredDriveApp(t *testing.T) {
 	staged := func(name string, size int64) string {
 		key := uploadLimitsKey(name, size)
 		stageUploadLimitsObjects(t, db, key)
-		fake.putObject(key, size)
+		fake.PutObject(key, size)
 		return key
 	}
 	photosFile, err := createTestFile(t, c, ente.Photos, insertUploadLimitsCollection(t, db, ente.Photos),
@@ -818,4 +822,47 @@ func TestUpdateThumbnailUsesTheStoredDriveApp(t *testing.T) {
 	requireQuotaExceeded(t, updateThumbnail(driveFile.ID, staged("drive-thumb-new", 5)))
 	require.NoError(t, updateThumbnail(driveFile.ID, reservedThumb))
 	require.NoError(t, updateThumbnail(photosFile.ID, staged("photos-thumb-new", 5)))
+}
+
+func TestOneSubscriptionCantTakeEveryReservationSlot(t *testing.T) {
+	c, db, _ := setupQuotaTest(t, 100*gib)
+	setDriveReservationLimits(t, maxConcurrentDriveReservations, 5*gotime.Second)
+	otherUserID := testutil.InsertUser(t, db, testutil.UserFixture{UserID: 2, Email: "quota-slots-other@ente.com", CreationTime: 1})
+	testutil.InsertUsage(t, db, otherUserID, 0)
+	testutil.InsertSubscription(t, db, testutil.SubscriptionFixture{
+		UserID: otherUserID, Storage: 10 * gib, ExpiryTime: gotime.Now().Add(gotime.Hour).UnixMicro(),
+	})
+	holder := testutil.HoldQuotaLock(t, db, uploadLimitsUserID)
+
+	const starts = maxConcurrentDriveReservationsPerAdmin + 2
+	results := make(chan error, starts)
+	for range starts {
+		go func() {
+			_, err := startDriveUpload(c, uploadLimitsUserID, gib)
+			results <- err
+		}()
+	}
+	testutil.WaitForAdvisoryLockWaiters(t, db, maxConcurrentDriveReservationsPerAdmin)
+	gotime.Sleep(200 * gotime.Millisecond)
+	testutil.WaitForAdvisoryLockWaiters(t, db, maxConcurrentDriveReservationsPerAdmin)
+	requireDriveUpload(t, c, otherUserID, gib)
+
+	require.NoError(t, holder.Rollback())
+	for range starts {
+		require.NoError(t, <-results)
+	}
+	require.Zero(t, driveReservationAdminSlots.Len())
+}
+
+func TestQuotaLockTimesOutBeforeTheContext(t *testing.T) {
+	c, db, _ := setupQuotaTest(t, 10*gib)
+	setDriveReservationLimits(t, 1, 2*gotime.Second)
+	testutil.HoldQuotaLock(t, db, uploadLimitsUserID)
+	start := gotime.Now()
+	_, err := startDriveUpload(c, uploadLimitsUserID, gib)
+	testutil.RequireAPIError(t, err, http.StatusServiceUnavailable, ente.QuotaCheckBusy)
+	require.ErrorContains(t, err, "lock timeout")
+	elapsed := gotime.Since(start)
+	require.Greater(t, elapsed, gotime.Second)
+	require.Less(t, elapsed, 2*gotime.Second-quotaLockTimeoutMargin/2)
 }

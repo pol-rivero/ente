@@ -19,13 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setViperForTest(t *testing.T, key string, value any) {
-	t.Helper()
-	previous := viper.Get(key)
-	viper.Set(key, value)
-	t.Cleanup(func() { viper.Set(key, previous) })
-}
-
 func TestDeleteCollectionV4Responses(t *testing.T) {
 	testutil.WithServerRoot(t)
 	db := testutil.RequireTestDB(t)
@@ -110,12 +103,12 @@ func TestDeleteCollectionV4Responses(t *testing.T) {
 	requireError(path(photos, false, true), http.StatusBadRequest, ente.InvalidCollection)
 	requireError(path(uncategorized, false, false), http.StatusBadRequest, ente.InvalidCollection)
 
-	setViperForTest(t, "collections.max-recursive-delete", 1)
+	testutil.SetViper(t, "collections.max-recursive-delete", 1)
 	requireError(path(root, true, true), http.StatusBadRequest, ente.SubtreeTooLarge)
 	requireError(path(root, true, false), http.StatusConflict, ente.CollectionNotEmpty)
 	requireError(path(root, false, false), http.StatusConflict, ente.HasChildren)
 
-	setViperForTest(t, "collections.recursive-delete-timeout-seconds", 1)
+	testutil.SetViper(t, "collections.recursive-delete-timeout-seconds", 1)
 	holder, err := db.Begin()
 	require.NoError(t, err)
 	_, err = holder.Exec(`SELECT pg_advisory_xact_lock(hashtextextended('ctree:' || $1::bigint, 0))`, 1)

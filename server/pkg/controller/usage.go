@@ -54,15 +54,22 @@ func GetLockerLimitsForTier(isPaid bool) LockerLimits {
 	return limits
 }
 
-const maxConcurrentDriveReservations = 8
+const (
+	maxConcurrentDriveReservations         = 8
+	maxConcurrentDriveReservationsPerAdmin = 2
+	// lock_timeout fires this long before the context deadline: a cancelled
+	// query makes lib/pq open a new connection to send the cancel request.
+	quotaLockTimeoutMargin = 500 * gTime.Millisecond
+)
 
 // Reservation transactions hold a pooled connection while they wait for the
 // quota lock. The slots bound how many can wait at once (waiting for a slot
-// holds no connection), and the timeout bounds the slot wait plus the
-// transaction.
+// holds no connection), so one subscription can't take every slot, and the
+// timeout bounds the slot waits plus the transaction.
 var (
-	driveReservationSlots   = make(chan struct{}, maxConcurrentDriveReservations)
-	driveReservationTimeout = 10 * gTime.Second
+	driveReservationSlots      = make(chan struct{}, maxConcurrentDriveReservations)
+	driveReservationAdminSlots = NewKeyedSlots(maxConcurrentDriveReservationsPerAdmin)
+	driveReservationTimeout    = 10 * gTime.Second
 )
 
 func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size *int64, app ente.App) error {
@@ -85,6 +92,11 @@ func (c *UsageController) CanUploadFile(ctx context.Context, userID int64, size 
 		}
 	}
 	return c.checkAndUpdateCache(ctx, userID, size, app)
+}
+
+// Ignores every reservation, including the objects' own.
+func (c *UsageController) CanCommitReservedDriveObjects(ctx context.Context, userID int64, sizeDelta int64) error {
+	return c.canUploadFile(ctx, userID, &sizeDelta, ente.Drive)
 }
 
 // The excluded objects aren't counted as reservations: the caller adds their
@@ -121,6 +133,11 @@ func (c *UsageController) ReserveDriveUpload(ctx context.Context, userID int64, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, driveReservationTimeout)
 	defer cancel()
+	releaseAdmin, ok := driveReservationAdminSlots.Acquire(ctx, plan.adminID)
+	if !ok {
+		return stacktrace.Propagate(ente.ErrQuotaCheckBusy, "no free reservation slot for admin %d", plan.adminID)
+	}
+	defer releaseAdmin()
 	release, ok := AcquireSlot(ctx, driveReservationSlots)
 	if !ok {
 		return stacktrace.Propagate(ente.ErrQuotaCheckBusy, "no free reservation slot")
@@ -140,7 +157,8 @@ func (c *UsageController) reserveDriveUploadTx(ctx context.Context, plan *quotaP
 		return stacktrace.Propagate(err, "")
 	}
 	defer tx.Rollback()
-	if err := c.UsageRepo.LockQuota(ctx, tx, plan.adminID, driveReservationTimeout); err != nil {
+	deadline, _ := ctx.Deadline()
+	if err := c.UsageRepo.LockQuota(ctx, tx, plan.adminID, gTime.Until(deadline)-quotaLockTimeoutMargin); err != nil {
 		return stacktrace.Propagate(err, "")
 	}
 	usage, err := c.UsageRepo.GetUsageWithDriveReservations(ctx, tx, time.Microseconds(), plan.userIDs, userID, nil)

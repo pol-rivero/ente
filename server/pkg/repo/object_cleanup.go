@@ -25,13 +25,13 @@ type ObjectCleanupRepository struct {
 const insertTempObjectQuery = `
 		INSERT INTO temp_objects (
 		    object_key, expiration_time, upload_id, is_multipart, bucket_id,
-		    user_id, app, purpose, content_length, content_md5, client, part_length, reservation_released
-		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12, $13)`
+		    user_id, app, purpose, content_length, content_md5, client, part_length, reservation_released, is_copy
+		) VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6::BIGINT, 0), NULLIF($7, ''), NULLIF($8, ''), $9, $10, NULLIF($11, ''), $12, $13, $14)`
 
 func insertTempObjectArgs(tempObject ente.TempObject, expirationTime int64) []any {
 	return []any{tempObject.ObjectKey, expirationTime, tempObject.UploadID, tempObject.IsMultipart, tempObject.BucketId,
 		tempObject.UserID, tempObject.App, tempObject.Purpose, tempObject.ContentLength, tempObject.ContentMD5, tempObject.Client,
-		tempObject.PartLength, tempObject.ReservationReleased}
+		tempObject.PartLength, tempObject.ReservationReleased, tempObject.IsCopy}
 }
 
 func (repo *ObjectCleanupRepository) AddTempObject(tempObject ente.TempObject, expirationTime int64) error {
@@ -52,19 +52,15 @@ func (repo *ObjectCleanupRepository) AddTempObjectTx(ctx context.Context, tx *sq
 // Expired or released rows aren't updated: the cron may hold them locked
 // across S3 calls, and their upload was cancelled anyway.
 func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, objectKey string, uploadID string, now int64) error {
-	res, err := repo.DB.ExecContext(ctx, `
+	updated, err := affectsOne(repo.DB.ExecContext(ctx, `
 		UPDATE temp_objects SET upload_id = $2, is_multipart = TRUE
 		WHERE object_key = $1 AND upload_id IS NULL AND NOT is_multipart
 		  AND expiration_time > $3 AND NOT reservation_released`,
-		objectKey, uploadID, now)
+		objectKey, uploadID, now))
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return err
 	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	if rowsAffected != 1 {
+	if !updated {
 		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to set its upload ID", objectKey)
 	}
 	return nil
@@ -73,19 +69,15 @@ func (repo *ObjectCleanupRepository) SetTempObjectUploadID(ctx context.Context, 
 // Turns an unused single-PUT row into a pending multipart one, so a crash
 // after CreateMultipartUpload leaves a row whose upload the cron finds.
 func (repo *ObjectCleanupRepository) SetTempObjectPartLength(ctx context.Context, objectKey string, partLength int64, now int64) error {
-	res, err := repo.DB.ExecContext(ctx, `
+	updated, err := affectsOne(repo.DB.ExecContext(ctx, `
 		UPDATE temp_objects SET part_length = $2
 		WHERE object_key = $1 AND upload_id IS NULL AND NOT is_multipart
 		  AND expiration_time > $3 AND NOT reservation_released`,
-		objectKey, partLength, now)
+		objectKey, partLength, now))
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return err
 	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	if rowsAffected != 1 {
+	if !updated {
 		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to set its part length", objectKey)
 	}
 	return nil
@@ -174,18 +166,14 @@ func (repo *ObjectCleanupRepository) GetLiveTempObjects(ctx context.Context, use
 
 // Turns a row whose upload was aborted back into a pending one, so the copy can start again.
 func (repo *ObjectCleanupRepository) ResetTempObjectUpload(ctx context.Context, objectKey string, uploadID string, now int64) error {
-	res, err := repo.DB.ExecContext(ctx, `
+	updated, err := affectsOne(repo.DB.ExecContext(ctx, `
 		UPDATE temp_objects SET upload_id = NULL, is_multipart = FALSE
 		WHERE object_key = $1 AND upload_id = $2 AND expiration_time > $3 AND NOT reservation_released`,
-		objectKey, uploadID, now)
+		objectKey, uploadID, now))
 	if err != nil {
-		return stacktrace.Propagate(err, "")
+		return err
 	}
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	if rowsAffected != 1 {
+	if !updated {
 		return stacktrace.Propagate(ente.ErrUploadGone, "temp object %s not found to reset its upload", objectKey)
 	}
 	return nil
@@ -210,24 +198,23 @@ var ErrTempObjectLocked = errors.New("temp object is locked by another transacti
 type LockedTempObject struct {
 	ente.TempObject
 	ResumePartsCompleted int64
+	ExpirationTime       int64
 }
 
-// NOWAIT: a concurrent resume, abort or Create can hold the row across S3
-// calls; fail fast rather than tie up a pooled connection waiting for it.
+// NOWAIT: fail fast if a concurrent resume, abort or Create holds the row.
 func (repo *ObjectCleanupRepository) LockLiveTempObject(ctx context.Context, tx *sql.Tx, objectKey string, now int64) (LockedTempObject, error) {
 	var row LockedTempObject
 	var uploadID, bucketID, app, purpose sql.NullString
 	var userID, contentLength, partLength sql.NullInt64
 	err := tx.QueryRowContext(ctx, `
 		SELECT is_multipart, upload_id, bucket_id, user_id, app, purpose, content_length, part_length,
-		       COALESCE(resume_parts_completed, 0)
+		       COALESCE(resume_parts_completed, 0), expiration_time, is_copy
 		FROM temp_objects
 		WHERE object_key = $1 AND expiration_time > $2 AND NOT reservation_released
 		FOR UPDATE NOWAIT`, objectKey, now).
 		Scan(&row.IsMultipart, &uploadID, &bucketID, &userID, &app, &purpose, &contentLength, &partLength,
-			&row.ResumePartsCompleted)
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "55P03" {
+			&row.ResumePartsCompleted, &row.ExpirationTime, &row.IsCopy)
+	if isLockTimeout(err) {
 		return row, stacktrace.Propagate(ErrTempObjectLocked, "")
 	}
 	if err != nil {
@@ -248,14 +235,80 @@ func (repo *ObjectCleanupRepository) LockLiveTempObject(ctx context.Context, tx 
 	return row, nil
 }
 
-func (repo *ObjectCleanupRepository) ExtendTempObjectExpiry(ctx context.Context, tx *sql.Tx, objectKey string, expiry int64, maxAge int64, partsCompleted *int64) error {
-	_, err := tx.ExecContext(ctx, `
-		UPDATE temp_objects
-		SET expiration_time = GREATEST(expiration_time, LEAST($2, created_at + $3)),
-		    resume_parts_completed = COALESCE($4, resume_parts_completed)
-		WHERE object_key = $1`,
-		objectKey, expiry, maxAge, partsCompleted)
+// The upload read by LockLiveTempObject may have been committed, cancelled or
+// expired since; found is false then. partsCompleted may be nil. NOWAIT, like
+// LockLiveTempObject: the cron may hold the row across S3 calls.
+func (repo *ObjectCleanupRepository) ExtendLiveUploadExpiry(ctx context.Context, objectKey string, uploadID string, now int64,
+	expiry int64, maxAge int64, partsCompleted *int64) (newExpiry int64, found bool, err error) {
+	err = repo.DB.QueryRowContext(ctx, `
+		WITH locked AS (
+			SELECT object_key FROM temp_objects
+			WHERE object_key = $1 AND upload_id = $2 AND expiration_time > $3 AND NOT reservation_released
+			FOR UPDATE NOWAIT
+		)
+		UPDATE temp_objects t
+		SET expiration_time = GREATEST(t.expiration_time, LEAST($4, t.created_at + $5)),
+			resume_parts_completed = GREATEST(t.resume_parts_completed, $6)
+		FROM locked WHERE t.object_key = locked.object_key
+		RETURNING t.expiration_time`,
+		objectKey, uploadID, now, expiry, maxAge, partsCompleted).Scan(&newExpiry)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if isLockTimeout(err) {
+		return 0, false, stacktrace.Propagate(ErrTempObjectLocked, "")
+	}
+	return newExpiry, err == nil, stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCleanupRepository) ExpireLiveUpload(ctx context.Context, objectKey string, uploadID string, userID int64, now int64) error {
+	_, err := repo.DB.ExecContext(ctx, `
+		WITH locked AS (
+			SELECT object_key FROM temp_objects
+			WHERE object_key = $2 AND upload_id = $3 AND user_id = $4 AND expiration_time > $1 AND NOT reservation_released
+			FOR UPDATE NOWAIT
+		)
+		UPDATE temp_objects t SET expiration_time = $1, reservation_released = TRUE
+		FROM locked WHERE t.object_key = locked.object_key`,
+		now, objectKey, uploadID, userID)
+	if isLockTimeout(err) {
+		return stacktrace.Propagate(ErrTempObjectLocked, "")
+	}
 	return stacktrace.Propagate(err, "")
+}
+
+func (repo *ObjectCleanupRepository) IsLiveUpload(ctx context.Context, objectKey string, uploadID string, now int64) (bool, error) {
+	var live bool
+	err := repo.DB.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM temp_objects
+			WHERE object_key = $1 AND upload_id = $2 AND expiration_time > $3 AND NOT reservation_released)`,
+		objectKey, uploadID, now).Scan(&live)
+	return live, stacktrace.Propagate(err, "")
+}
+
+// Pages are ordered by object key, starting after the given one. Copy
+// reservations aren't the client's to resume or abort.
+func (repo *ObjectCleanupRepository) GetLiveDriveReservations(ctx context.Context, userID int64, now int64, afterKey string, limit int) ([]ente.PendingUpload, error) {
+	rows, err := repo.DB.QueryContext(ctx, `
+		SELECT t.object_key, COALESCE(t.content_length, 0), t.is_multipart OR t.part_length IS NOT NULL,
+		       COALESCE(t.created_at, 0), t.expiration_time
+		FROM temp_objects t
+		WHERE t.user_id = $1 AND t.object_key > $3 AND NOT t.is_copy AND `+liveDriveReservation+`
+		ORDER BY t.object_key
+		LIMIT $4`, userID, now, afterKey, limit)
+	if err != nil {
+		return nil, stacktrace.Propagate(err, "")
+	}
+	defer rows.Close()
+	uploads := make([]ente.PendingUpload, 0)
+	for rows.Next() {
+		var upload ente.PendingUpload
+		if err := rows.Scan(&upload.ObjectKey, &upload.ContentLength, &upload.IsMultipart, &upload.CreatedAt, &upload.ExpiresAt); err != nil {
+			return nil, stacktrace.Propagate(err, "")
+		}
+		uploads = append(uploads, upload)
+	}
+	return uploads, stacktrace.Propagate(rows.Err(), "")
 }
 
 func (repo *ObjectCleanupRepository) RemoveTempObjectKey(ctx context.Context, tx *sql.Tx, objectKey string, dc string) error {

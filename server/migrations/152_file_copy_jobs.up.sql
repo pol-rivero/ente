@@ -3,7 +3,6 @@ CREATE TABLE IF NOT EXISTS file_copy_jobs (
     id                BIGSERIAL PRIMARY KEY,
     user_id           BIGINT NOT NULL,
     request_id        TEXT   NOT NULL,
-    app               TEXT   NOT NULL,
     src_collection_id BIGINT NOT NULL,
     dst_collection_id BIGINT NOT NULL,
     items             JSONB  NOT NULL,
@@ -25,9 +24,9 @@ CREATE INDEX IF NOT EXISTS file_copy_jobs_unfinished_idx
     ON file_copy_jobs (id)
     WHERE status IN ('pending', 'running');
 
-CREATE INDEX IF NOT EXISTS file_copy_jobs_running_user_idx
+CREATE INDEX IF NOT EXISTS file_copy_jobs_unfinished_user_idx
     ON file_copy_jobs (user_id)
-    WHERE status = 'running';
+    WHERE status IN ('pending', 'running');
 
 CREATE INDEX IF NOT EXISTS file_copy_jobs_finished_idx
     ON file_copy_jobs (updated_at)

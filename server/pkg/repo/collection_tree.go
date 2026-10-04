@@ -32,29 +32,9 @@ func (n *CollectionTreeNode) IsLiveDriveFolderOf(ownerID int64) bool {
 }
 
 // Every structural change to an owner's folder tree runs in a transaction
-// that takes this lock first. change must use only tx: a second pooled
-// connection taken while waiters hold the rest of the pool would never come.
+// that takes this lock first.
 func (repo *CollectionRepository) InCollectionTreeTx(ctx context.Context, ownerID int64, lockTimeout time.Duration, change func(tx *sql.Tx) error) error {
-	tx, err := repo.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	defer tx.Rollback()
-	if err := lockCollectionTree(ctx, tx, ownerID, lockTimeout); err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	if err := change(tx); err != nil {
-		return stacktrace.Propagate(err, "")
-	}
-	return stacktrace.Propagate(tx.Commit(), "")
-}
-
-func lockCollectionTree(ctx context.Context, tx *sql.Tx, ownerID int64, timeout time.Duration) error {
-	err := lockAdvisoryXact(ctx, tx, "ctree", ownerID, timeout)
-	if isLockTimeout(err) {
-		return stacktrace.Propagate(ErrCollectionTreeLockTimeout, "%v", err)
-	}
-	return stacktrace.Propagate(err, "")
+	return InAdvisoryLockTx(ctx, repo.DB, "ctree", ownerID, lockTimeout, ErrCollectionTreeLockTimeout, change)
 }
 
 // Returns nil if the collection doesn't exist.
@@ -73,40 +53,39 @@ func (repo *CollectionRepository) GetTreeNodeTx(ctx context.Context, tx *sql.Tx,
 
 // Returns the collection's ID followed by its ancestors' IDs up to the root,
 // at most limit of them.
-func (repo *CollectionRepository) GetAncestorIDsTx(ctx context.Context, tx *sql.Tx, collectionID int64, limit int) ([]int64, error) {
+func (repo *CollectionRepository) GetAncestorIDsTx(ctx context.Context, tx *sql.Tx, ownerID, collectionID int64, limit int) ([]int64, error) {
 	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE anc(id, pid, d) AS (
-			SELECT collection_id, parent_id, 1 FROM collections WHERE collection_id = $1
+			SELECT collection_id, parent_id, 1 FROM collections
+			WHERE collection_id = $2 AND owner_id = $1 AND app = 'drive'
 			UNION ALL
 			SELECT c.collection_id, c.parent_id, a.d + 1
 			FROM collections c JOIN anc a ON c.collection_id = a.pid
-			WHERE a.d < $2)
-		SELECT id FROM anc ORDER BY d`, collectionID, limit)
+			WHERE a.d < $3 AND c.owner_id = $1 AND c.app = 'drive')
+		SELECT id FROM anc ORDER BY d`, ownerID, collectionID, limit)
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "")
 	}
-	defer rows.Close()
-	ids := make([]int64, 0)
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, stacktrace.Propagate(err, "")
-		}
-		ids = append(ids, id)
-	}
-	return ids, stacktrace.Propagate(rows.Err(), "")
+	return scanInt64s(rows)
 }
+
+// There's no index on parent_id: descendant walks read the owner's live Drive
+// rows once (collections_owner_id_index) and hash join over them.
+const ownerLiveDriveRows = `owned AS MATERIALIZED (
+			SELECT collection_id, parent_id FROM collections
+			WHERE owner_id = $1 AND app = 'drive' AND NOT is_deleted)`
 
 // Counts the collection itself as 1 and skips deleted descendants. Returns at
 // most limit.
-func (repo *CollectionRepository) GetSubtreeHeightTx(ctx context.Context, tx *sql.Tx, collectionID int64, limit int) (int, error) {
+func (repo *CollectionRepository) GetSubtreeHeightTx(ctx context.Context, tx *sql.Tx, ownerID, collectionID int64, limit int) (int, error) {
 	var height sql.NullInt64
-	err := tx.QueryRowContext(ctx, `WITH RECURSIVE sub(id, d) AS (
-			SELECT collection_id, 1 FROM collections WHERE collection_id = $1
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE `+ownerLiveDriveRows+`,
+		sub(id, d) AS (
+			SELECT collection_id, 1 FROM owned WHERE collection_id = $2
 			UNION ALL
-			SELECT c.collection_id, s.d + 1
-			FROM collections c JOIN sub s ON c.parent_id = s.id
-			WHERE s.d < $2 AND NOT c.is_deleted)
-		SELECT max(d) FROM sub`, collectionID, limit).Scan(&height)
+			SELECT o.collection_id, s.d + 1
+			FROM owned o JOIN sub s ON o.parent_id = s.id
+			WHERE s.d < $3)
+		SELECT max(d) FROM sub`, ownerID, collectionID, limit).Scan(&height)
 	return int(height.Int64), stacktrace.Propagate(err, "")
 }
 
@@ -120,25 +99,38 @@ func (repo *CollectionRepository) SetParentTx(ctx context.Context, tx *sql.Tx, c
 // Returns at most limit live collections of the subtree, the root included.
 // Live folders below a deleted one aren't part of it: the trash worker
 // re-roots them (ReRootLiveChildrenTx).
-func (repo *CollectionRepository) GetLiveSubtreeIDsTx(ctx context.Context, tx *sql.Tx, collectionID int64, limit int) ([]int64, error) {
-	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE sub(id) AS (
-			SELECT collection_id FROM collections WHERE collection_id = $1 AND NOT is_deleted
+func (repo *CollectionRepository) GetLiveSubtreeIDsTx(ctx context.Context, tx *sql.Tx, ownerID, collectionID int64, limit int) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, `WITH RECURSIVE `+ownerLiveDriveRows+`,
+		sub(id) AS (
+			SELECT collection_id FROM owned WHERE collection_id = $2
 			UNION
-			SELECT c.collection_id
-			FROM collections c JOIN sub s ON c.parent_id = s.id
-			WHERE NOT c.is_deleted)
-		SELECT id FROM sub LIMIT $2`, collectionID, limit)
+			SELECT o.collection_id
+			FROM owned o JOIN sub s ON o.parent_id = s.id)
+		SELECT id FROM sub LIMIT $3`, ownerID, collectionID, limit)
 	if err != nil {
 		return nil, stacktrace.Propagate(err, "")
 	}
 	return scanInt64s(rows)
 }
 
+func (repo *CollectionRepository) HasLiveChildrenTx(ctx context.Context, tx *sql.Tx, ownerID, parentID int64) (bool, error) {
+	return hasLiveChildren(ctx, tx, ownerID, parentID)
+}
+
+func hasLiveChildren(ctx context.Context, db interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, ownerID, parentID int64) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM collections
+		WHERE owner_id = $1 AND app = 'drive' AND parent_id = $2 AND NOT is_deleted)`, ownerID, parentID).Scan(&exists)
+	return exists, stacktrace.Propagate(err, "")
+}
+
 // Older binaries could delete a folder without its children.
-func (repo *CollectionRepository) ReRootLiveChildrenTx(ctx context.Context, tx *sql.Tx, parentID int64, updationTime int64) (int64, error) {
+func (repo *CollectionRepository) ReRootLiveChildrenTx(ctx context.Context, tx *sql.Tx, ownerID, parentID int64, updationTime int64) (int64, error) {
 	result, err := tx.ExecContext(ctx, `UPDATE collections
-		SET parent_id = NULL, parent_encrypted_key = NULL, parent_key_nonce = NULL, updation_time = $2
-		WHERE parent_id = $1 AND NOT is_deleted`, parentID, updationTime)
+		SET parent_id = NULL, parent_encrypted_key = NULL, parent_key_nonce = NULL, updation_time = $3
+		WHERE owner_id = $1 AND app = 'drive' AND parent_id = $2 AND NOT is_deleted`, ownerID, parentID, updationTime)
 	if err != nil {
 		return 0, stacktrace.Propagate(err, "")
 	}

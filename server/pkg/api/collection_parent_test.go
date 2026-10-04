@@ -182,8 +182,11 @@ func (f *collectionResponseFixture) createDriveFolder(t *testing.T, parentID *in
 		key, nonce := "parent-key", "parent-nonce"
 		collection.ParentID, collection.ParentEncryptedKey, collection.ParentKeyNonce = parentID, &key, &nonce
 	}
-	created, err := f.collectionRepo.Create(collection)
+	tx, err := f.db.Begin()
 	require.NoError(t, err)
+	created, err := f.collectionRepo.CreateTx(t.Context(), tx, collection)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
 	return created.ID
 }
 
@@ -266,9 +269,14 @@ func TestNonDriveCreateIgnoresClientParentFields(t *testing.T) {
 	for _, clientPackage := range []string{"io.ente.photos", "io.ente.locker"} {
 		for _, collectionType := range []string{"album", "folder"} {
 			plain := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, clientPackage, createBody(collectionType, ""))
-			withParent := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, clientPackage, createBody(collectionType,
-				fmt.Sprintf(`,"parentID":%d,"parentEncryptedKey":"parent-key","parentKeyNonce":"parent-nonce"`, rootID)))
-			require.Equal(t, string(normalize.ReplaceAll(plain, nil)), string(normalize.ReplaceAll(withParent, nil)))
+			for _, parentFields := range []string{
+				fmt.Sprintf(`,"parentID":%d,"parentEncryptedKey":"parent-key","parentKeyNonce":"parent-nonce"`, rootID),
+				`,"parentID":"abc","parentEncryptedKey":1,"parentKeyNonce":{}`,
+				`,"parentID":1.5`,
+			} {
+				withParent := f.request(t, http.MethodPost, "/collections", parentTestOwnerID, clientPackage, createBody(collectionType, parentFields))
+				require.Equal(t, string(normalize.ReplaceAll(plain, nil)), string(normalize.ReplaceAll(withParent, nil)))
+			}
 		}
 	}
 	var withParentColumns int
@@ -300,6 +308,11 @@ func TestDriveCreateAndMoveWithParent(t *testing.T) {
 		createBody("folder", fmt.Sprintf(`,"parentID":%d,%s`, int64(1_000_000), parentFields)))
 	require.Equal(t, http.StatusBadRequest, recorder.Code)
 	require.Contains(t, recorder.Body.String(), `"code":"INVALID_PARENT"`)
+	for _, malformed := range []string{`,"parentID":"1"`, fmt.Sprintf(`,"parentID":%d,"parentEncryptedKey":1,"parentKeyNonce":"n"`, rootID)} {
+		recorder = f.do(http.MethodPost, "/collections", parentTestOwnerID, "io.ente.drive", createBody("folder", malformed))
+		require.Equal(t, http.StatusBadRequest, recorder.Code, malformed)
+		require.Contains(t, recorder.Body.String(), `"code":"BAD_REQUEST"`)
+	}
 
 	var sinceTime int64
 	require.NoError(t, f.db.QueryRow(`SELECT max(updation_time) FROM collections`).Scan(&sinceTime))

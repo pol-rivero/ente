@@ -93,7 +93,7 @@ func (c *CollectionController) validParentAncestors(ctx context.Context, tx *sql
 	if !parent.IsLiveDriveFolderOf(ownerID) {
 		return nil, stacktrace.Propagate(ente.ErrInvalidParent, "parent %d", parentID)
 	}
-	ancestors, err := c.CollectionRepo.GetAncestorIDsTx(ctx, tx, parentID, ente.MaxCollectionDepth)
+	ancestors, err := c.CollectionRepo.GetAncestorIDsTx(ctx, tx, ownerID, parentID, ente.MaxCollectionDepth)
 	return ancestors, stacktrace.Propagate(err, "")
 }
 
@@ -149,7 +149,7 @@ func (c *CollectionController) MoveCollection(ctx context.Context, actorUserID i
 			if slices.Contains(ancestors, req.CollectionID) {
 				return stacktrace.Propagate(ente.ErrCollectionCycle, "")
 			}
-			height, err := c.CollectionRepo.GetSubtreeHeightTx(ctx, tx, req.CollectionID, ente.MaxCollectionDepth-len(ancestors)+1)
+			height, err := c.CollectionRepo.GetSubtreeHeightTx(ctx, tx, actorUserID, req.CollectionID, ente.MaxCollectionDepth-len(ancestors)+1)
 			if err != nil {
 				return stacktrace.Propagate(err, "")
 			}
