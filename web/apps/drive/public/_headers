@@ -1,0 +1,13 @@
+/*
+    Cache-Control: no-store, must-revalidate
+    Strict-Transport-Security: max-age=63072000
+    X-Content-Type-Options: nosniff
+    X-Download-Options: noopen
+    X-Frame-Options: deny
+    X-XSS-Protection: 1; mode=block
+    Content-Security-Policy: frame-ancestors 'none'
+    Referrer-Policy: no-referrer
+
+/images/favicon.png
+    ! Cache-Control
+    Cache-Control: public, max-age=86400

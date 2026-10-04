@@ -2581,6 +2581,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ente-drive-wasm"
+version = "0.0.0"
+dependencies = [
+ "ente-wasm-lib",
+]
+
+[[package]]
 name = "ente-ensu"
 version = "0.0.0"
 dependencies = [

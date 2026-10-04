@@ -14,6 +14,7 @@ members = [
     "bindings/uniffi/log",
     "bindings/wasm/auth",
     "bindings/wasm/cast",
+    "bindings/wasm/drive",
     "bindings/wasm/ensu",
     "bindings/wasm/legacy",
     "bindings/wasm/lib",

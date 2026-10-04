@@ -1,6 +1,7 @@
 {
     "workspaces": {
         "apps/*": { "next": true },
+        "apps/drive": { "next": true, "entry": ["src/services/drive-api.ts"] },
         "apps/payments": { "next": false }
     }
 }

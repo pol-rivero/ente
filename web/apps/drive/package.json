@@ -1,0 +1,23 @@
+{
+    "name": "drive",
+    "version": "0.0.0",
+    "private": true,
+    "scripts": {
+        "test": "vitest --run"
+    },
+    "dependencies": {
+        "@fontsource-variable/outfit": "5.2.8",
+        "ente-accounts": "*",
+        "ente-base": "*",
+        "ente-drive-wasm": "*",
+        "ente-new": "*",
+        "ente-utils": "*",
+        "idb": "8.0.3",
+        "zod": "4.4.3"
+    },
+    "devDependencies": {
+        "ente-build-config": "*",
+        "vite-plugin-wasm": "3.6.0",
+        "vitest": "4.1.11"
+    }
+}

@@ -18,6 +18,9 @@ const getTheme = (appName: AppName): Theme => {
     });
 };
 
+const usesSharePalette = (appName: AppName) =>
+    appName == "share" || appName == "locker" || appName == "drive";
+
 const getColors = (appName: AppName) => ({
     ..._colors,
     fixed: {
@@ -31,7 +34,7 @@ const getColors = (appName: AppName) => ({
     accent:
         appName == "auth"
             ? _colors.accentAuth
-            : appName == "share" || appName == "locker"
+            : usesSharePalette(appName)
               ? _colors.accentShare
               : appName == "ensu"
                 ? _colors.accentEnsu
@@ -41,23 +44,21 @@ const getColors = (appName: AppName) => ({
             ? _colors.accentEnsu
             : appName == "auth"
               ? _colors.accentAuth
-              : appName == "share" || appName == "locker"
+              : usesSharePalette(appName)
                 ? _colors.accentShare
                 : _colors.accentPhotos,
     accentContrastText:
         appName == "ensu" ? _colors.fixed.black : _colors.fixed.white,
-    light:
-        appName == "share" || appName == "locker"
-            ? _colors.lightShare
-            : appName == "ensu"
-              ? _colors.lightEnsu
-              : _colors.light,
-    dark:
-        appName == "share" || appName == "locker"
-            ? _colors.darkShare
-            : appName == "ensu"
-              ? _colors.darkEnsu
-              : _colors.dark,
+    light: usesSharePalette(appName)
+        ? _colors.lightShare
+        : appName == "ensu"
+          ? _colors.lightEnsu
+          : _colors.light,
+    dark: usesSharePalette(appName)
+        ? _colors.darkShare
+        : appName == "ensu"
+          ? _colors.darkEnsu
+          : _colors.dark,
 });
 
 const _colors = {
@@ -618,7 +619,8 @@ const components: Components = {
 };
 
 const getComponents = (appName: AppName): Components => {
-    if (appName !== "ensu" && appName !== "locker") return components;
+    if (appName !== "ensu" && appName !== "locker" && appName !== "drive")
+        return components;
 
     const muiButtonStyleOverrides = (components.MuiButton?.styleOverrides ??
         {}) as Record<string, unknown>;
@@ -642,7 +644,7 @@ const getComponents = (appName: AppName): Components => {
     const muiDialogContentStyleOverrides = (components.MuiDialogContent
         ?.styleOverrides ?? {}) as Record<string, unknown>;
 
-    if (appName === "locker") {
+    if (appName === "locker" || appName === "drive") {
         return {
             ...components,
             MuiButton: {
@@ -759,3 +761,5 @@ export const ensuTheme = getTheme("ensu");
 export const shareTheme = getTheme("share");
 
 export const lockerTheme = getTheme("locker");
+
+export const driveTheme = getTheme("drive");
